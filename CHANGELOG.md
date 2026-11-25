@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- README: documents `LLMExtractor(llm, system_prompt=..., scopes=...)`, which has been available
+  since 0.1.0 but was only shown in `examples/git_commits.py`. A new "Use your own extraction
+  prompt" section shows how to extend the built-in prompt for a product
+
 ## 0.3.0 (2026-11-26)
 
 Tested as a customer-support bot for an online store (`evals/support_bot.py`, 10 scenarios).
@@ -45,8 +51,9 @@ First release.
 - Ranked retrieval, and the USE / MENTION / VERIFY / HOLD decision
 - SQLite store with an audit log, thread-safe, with collision-free ids across processes
 - `MemoryConfig` for every threshold; pluggable `Embedder` and `Extractor`
-- Works with any LLM: `LLMExtractor` takes any `(system, messages) -> str` function, and
-  `OpenAICompatible` is a zero-dependency client for any `/chat/completions` API
+- Works with any LLM: `LLMExtractor` takes any `(system, messages) -> str` function, plus your
+  own extraction prompt (`system_prompt`) and scope names (`scopes`), and `OpenAICompatible` is
+  a zero-dependency client for any `/chat/completions` API
 - Real embedding models: `OpenAICompatibleEmbedder` for any `/embeddings` API (cached,
   batched), `MemoryConfig.for_embedding_model()` thresholds, and `examples/tune_embedder.py`
   to measure your own model. Mixing vectors from two embedders raises a clear error

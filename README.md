@@ -239,7 +239,7 @@ open the same SQLite file.
 | Call | When to use it |
 |---|---|
 | `MemoryManager(store, extractor=..., embedder=..., config=...)` | Once, at startup |
-| `LLMExtractor(llm)` | Lets any model extract memories. `llm` is a function `(system, messages) -> str` |
+| `LLMExtractor(llm, system_prompt=..., scopes=...)` | Lets any model extract memories. `llm` is a function `(system, messages) -> str`. `system_prompt` and `scopes` are optional: your own extraction instructions and scope names (see [Use your own extraction prompt](#use-your-own-extraction-prompt)) |
 | `OpenAICompatible(base_url=..., model=..., api_key=...)` | A ready-made `llm` for any `/chat/completions` API |
 | `OpenAICompatibleEmbedder(base_url=..., model=..., api_key=...)` | A ready-made embedder for any `/embeddings` API |
 | `MemoryConfig.for_embedding_model()` | Thresholds to start from with a real embedding model |
@@ -319,6 +319,40 @@ Keep `duplicate_similarity` high: "Allergic to peanuts" and "Allergic to tree nu
 
 **If location matters to most requests,** load it into every prompt. "A dinner spot near me" is
 hard to link to "Lives in Lisbon" by meaning alone: `config.profile_predicates.add("lives_in")`.
+
+### Use your own extraction prompt
+
+The built-in prompt is written for a personal assistant. When your product cares about other
+things, pass your own instructions to `LLMExtractor`. The easiest way is to add to the built-in
+prompt:
+
+```python
+from memwise import LLMExtractor, MemoryConfig
+from memwise.llm import EXTRACTION_SYSTEM
+
+STORE_NOTES = """
+This is the support assistant of an online kitchenware store. Also keep the customer's sizes
+(predicates apron_size and glove_size) and their preferred delivery slot (delivery_slot).
+"""
+
+extractor = LLMExtractor(llm, system_prompt=EXTRACTION_SYSTEM + STORE_NOTES,
+                         scopes=("general", "orders", "personal"))
+
+config = MemoryConfig.for_embedding_model()
+config.single_valued |= {"apron_size", "glove_size", "delivery_slot"}   # a new value replaces the old
+```
+
+- **`system_prompt`** replaces the extraction instructions. The model still has to reply in the
+  same JSON shape, `{"memories": [...]}`, with `kind` set to fact, preference, instruction or
+  episode, plus a `predicate` and a `value`. Items it can't use are skipped, and missing optional
+  fields get defaults.
+- **`scopes`** are the contexts your product uses. A memory with any other scope is filed as
+  "general". Pass the same names to `recall(user_id, message, scope="orders")`.
+- **New predicates** that hold one value at a time go in `config.single_valued`, as above.
+  Otherwise a new size is added next to the old one instead of replacing it.
+- For a completely different job, write the whole prompt yourself.
+  [`examples/git_commits.py`](examples/git_commits.py) does this to remember a repository instead
+  of a person.
 
 ### Write your own extractor
 
