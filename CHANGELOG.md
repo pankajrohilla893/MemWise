@@ -1,12 +1,12 @@
 # Changelog
 
-## 0.1.0
+## 0.1.0 (2026-11-26)
 
 First release.
 
 - `MemoryManager` with `ingest`, `add`, `recall`, `build_context`, `current`, `history`,
   `forget`, `forget_all`, `maintain`, `maintain_all` and `reembed`
-- A write gate with consent for sensitive data; ADD / CONFIRM / SUPERSEDE / RETRACT / IGNORE reconciliation
+- A write gate with consent for sensitive data; ADD / CONFIRM / SUPERSEDE / RETRACT / FORGET / IGNORE reconciliation
 - Validity windows, expiry and staleness checks; history is kept when facts change
 - Ranked retrieval, and the USE / MENTION / VERIFY / HOLD decision
 - SQLite store with an audit log, thread-safe, with collision-free ids across processes
