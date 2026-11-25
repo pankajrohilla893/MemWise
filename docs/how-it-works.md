@@ -129,6 +129,7 @@ score = 0.60 × relevance + 0.15 × recency + 0.15 × importance + 0.10 × confi
 
 | Check, in order | Action |
 |---|---|
+| A safety memory (an allergy, by default) | **USE**, in every scope, however unrelated it looks |
 | Belongs to a different scope than this conversation | **HOLD** |
 | Sensitive and only loosely related | **HOLD** |
 | Not relevant enough | **HOLD** |
@@ -137,12 +138,24 @@ score = 0.60 × relevance + 0.15 × recency + 0.15 × importance + 0.10 × confi
 | An episode (something that happened) | **MENTION**: it should change the answer |
 | Otherwise | **USE**, quietly |
 
+**Why allergies skip the checks.** Holding back is the safe default for most memories, but not
+for an allergy. Similarity can't reliably tell a food question from an unrelated one: with a
+typical embedding model, "Allergic to peanuts" scored 0.146 against "Help me write a cover
+letter" but 0.124 against some food questions, and "Give me a quick dinner recipe idea" fell
+just below the bar for sensitive memories. In testing, that held-back allergy led a model to
+suggest peanut noodles. So `MemoryConfig.safety_predicates` memories are retrieved every time
+(without taking `top_k` slots), used in every scope (models sometimes file an allergy as
+"personal", but a work chat about the team lunch needs it too), and never sent to VERIFY. They
+stay in force until the user retracts or forgets them.
+
 ### 3. The prompt
 
 `build_context()` writes the profile and each used memory, with an instruction matching its
-action: "apply quietly", "worth mentioning", "check with the user first". **HOLD items are
-not written at all.** A memory that isn't in the prompt can't leak, which is safer than telling
-the model not to mention it.
+action: "apply quietly", "worth mentioning", "check with the user first". Safety memories get
+their own section: "never suggest anything that conflicts with this; only bring it up when it
+matters". **HOLD items are not written at all.** A memory that isn't in the prompt can't leak,
+which is safer than telling the model not to mention it. Safety memories are the deliberate
+exception: there, missing the memory is the bigger risk.
 
 ## Maintenance
 

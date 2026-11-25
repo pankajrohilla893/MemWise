@@ -88,7 +88,7 @@ def main() -> None:
     ask("How should I cache user sessions in our API?", scope="work")
     ask("I'm stressed about work. Any tips to relax this weekend?", scope="personal")
     print(show.c("\n  Name and answer style are PROFILE memories: loaded every time.\n"
-                 "  The allergy is USED quietly (sensitive, but clearly relevant).\n"
+                 "  The allergy is a SAFETY memory: it's in every prompt, so it can't be missed.\n"
                  "  The Redis episode is MENTIONED: it should change the advice.\n"
                  "  Work memories are HELD in a personal chat, so they never reach the model.", "dim"))
 

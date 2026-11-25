@@ -19,7 +19,7 @@ whether a memory should be used at all.
 | **Write** | A write gate drops small talk and anything sensitive the user didn't ask you to keep. Every new memory is compared with what's already stored. | "I was diagnosed with…" (said in passing) → **not stored**. "Remember I'm allergic to peanuts" → **stored** |
 | **Maintain** | New facts **replace** old ones and the history is kept. Trips and projects expire on their own. Old facts are flagged for re-checking. | "I moved to Lisbon" → Berlin is closed, not overwritten |
 | **Retrieve** | Memories are ranked by relevance, recency, importance and confidence, not similarity alone. Only *current* facts are searched. | Outdated facts never reach the prompt |
-| **Surface** | Each memory gets one of **USE** (quietly), **MENTION**, **VERIFY** or **HOLD** (left out of the prompt). | Work facts stay out of a personal chat. "Still at Acme?" after 8 months |
+| **Surface** | Each memory gets one of **USE** (quietly), **MENTION**, **VERIFY** or **HOLD** (left out of the prompt). Allergies are never held back. | Work facts stay out of a personal chat. "Still at Acme?" after 8 months. No peanut recipes for a peanut allergy |
 
 It also gives users real control: they can see what's stored, delete one memory, or delete
 everything. Deleting also scrubs the audit log.
@@ -83,8 +83,8 @@ You are a friendly assistant.
 - Name is Ana
 - Prefers short answers - follow this
 
-## Memories relevant to this message
-- Allergic to peanuts (known since 2026-11-25) -> sensitive: apply it quietly, don't repeat it back
+## Always respect (safety)
+- Allergic to peanuts (known since 2026-11-25) -> never suggest anything that conflicts with this; only bring it up when it matters
 
 ## How to use memory
 - Memories are background, not a script. Answer the user's actual message.
@@ -93,7 +93,8 @@ You are a friendly assistant.
 ```
 
 "Lives in Berlin" is gone because it was replaced. "Lives in Lisbon" isn't relevant to snacks,
-so it isn't included either.
+so it isn't included either. The allergy is a **safety memory**: it goes into every prompt,
+because missing it could hurt someone (see [Privacy and safety defaults](#privacy-and-safety-defaults)).
 
 Run the full example: `python examples/quickstart.py`.
 
@@ -275,6 +276,7 @@ config = MemoryConfig(
 )
 config.single_valued.add("timezone")          # a user has one timezone at a time
 config.profile_predicates.add("preferred_language")  # include in every prompt
+config.safety_predicates.add("medication")    # never held back, like allergies
 
 memory = MemoryManager(store, config=config)
 ```
@@ -386,12 +388,12 @@ and `MEMWISE_EMBED_API_KEY`.
 ## Test it with your model
 
 The unit tests in `tests/` check the library's rules with a fake model. To check the whole
-system with *your* model, run the scenario evals: 23 realistic multi-session conversations
+system with *your* model, run the scenario evals: 24 realistic multi-session conversations
 (facts changing, "I quit coffee", sensitive details said in passing, instructions hidden in
 pasted text, other people's facts, hypotheticals, trips that expire, work vs personal context,
 stale facts, other languages, "please forget that…", short replies to the assistant's
-questions, "I left last week"), each with pass/fail checks on what was stored, what reached the
-prompt and, for some, the reply.
+questions, "I left last week", allergies), each with pass/fail checks on what was stored, what
+reached the prompt and, for some, the reply.
 
 ```bash
 python evals/scenarios.py              # needs MEMWISE_BASE_URL, MEMWISE_MODEL (and MEMWISE_API_KEY)
@@ -412,6 +414,11 @@ read paths, maintenance, deletion, and how memory differs from RAG.
   explicitly asks. They are never part of the always-loaded profile.
 - **Held-back memories are never sent.** HOLD items aren't in the prompt at all, so the model
   can't leak them.
+- **Allergies are never held back.** Similarity scores can't reliably tell "dinner ideas" from
+  "write a cover letter" for "Allergic to peanuts", and in testing, a held-back allergy led a
+  model to suggest peanut noodles. So allergies (`MemoryConfig.safety_predicates`) go into every
+  prompt, in every scope, with an instruction to respect them and only bring them up when they
+  matter. Add your own safety predicates, or pass an empty set to turn this off.
 - **Deletion is complete.** `forget` hard-deletes the memory and its older versions, and scrubs
   it from the audit log. `forget_all` removes everything about the user.
 - **Protection against memory poisoning.** The extraction prompt treats conversation text as

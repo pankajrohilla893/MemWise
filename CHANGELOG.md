@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Allergies are never held back.** A consented "allergic to peanuts" scored just below the bar
+  for sensitive memories against "Give me a quick dinner recipe idea", was held back, and a model
+  suggested peanut noodles. Memories under `MemoryConfig.safety_predicates` (default: `allergy`)
+  now go into every prompt, in every scope, in their own "Always respect (safety)" section, with
+  an instruction to respect them and only bring them up when they matter. They don't take
+  `top_k` slots and are never sent to VERIFY. Pass `safety_predicates=set()` to turn this off
+- Scenario evals: a new `allergies_are_never_held_back` scenario (24 in all), a check that the
+  allergy reaches the prompt in `memory_shapes_the_answer`, and judge questions phrased so that
+  "yes" means pass (the judge once reasoned "no peanuts" and then answered "yes")
+
 ## 0.1.0 (2026-11-26)
 
 First release.

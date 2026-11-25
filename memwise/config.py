@@ -67,6 +67,12 @@ class MemoryConfig:
     sensitive_relevant_enough: float = 0.30  # sensitive memories need a stronger reason
     stale_after_days: float = 180            # facts not reconfirmed this long get verified
     low_confidence: float = 0.6
+    # Safety memories: missing one can hurt the user, so they are never held back for looking
+    # unrelated. Similarity can't reliably tell "dinner ideas" from "write a cover letter" for
+    # "Allergic to peanuts", so every current one goes into the prompt, in every scope (a work
+    # chat about the team lunch needs it too), with an instruction to respect it and only bring
+    # it up when it matters. An empty set turns this off. Add your own, such as "medication".
+    safety_predicates: set[str] = field(default_factory=lambda: {"allergy"})
 
     # ---- upkeep (maintenance) -------------------------------------------
     prune_episodes_after_days: float = 120

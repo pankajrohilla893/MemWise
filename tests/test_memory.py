@@ -170,7 +170,11 @@ class ReadPath(unittest.TestCase):
         self.assertEqual(self.actions("Any snack ideas?").get("allergy"), "USE")
 
     def test_sensitive_memory_absent_when_unrelated(self):
-        self.assertNotIn("allergy", self.actions("Write a Python function to parse dates"))
+        self.mm.add(U, [Candidate(kind="fact", predicate="health", value="diabetes", text="Has diabetes",
+                                  sensitive=True, explicit=True)])
+        r = self.mm.recall(U, "Write a Python function to parse dates")
+        self.assertNotIn("health", {d.scored.memory.predicate for d in r.used})
+        self.assertNotIn("diabetes", self.mm.build_context(r))
 
     def test_episode_is_mentioned(self):
         self.assertEqual(self.actions("How should I cache sessions?", "work").get("experience"),
@@ -202,6 +206,68 @@ class ReadPath(unittest.TestCase):
         say(self.mm, "I just moved to Lisbon.")
         r = self.mm.recall(U, "What's the weather like in my city?")
         self.assertNotIn("Berlin", [d.scored.memory.value for d in r.items])
+
+
+class SafetyMemories(unittest.TestCase):
+    """Allergies reach the prompt even when the question looks unrelated: holding one back
+    because "dinner ideas" scored low once led a real model to suggest peanut noodles."""
+
+    UNRELATED = "Write a Python function to parse dates"
+
+    def setUp(self):
+        self.mm = manager()
+        say(self.mm, "I live in Berlin.", "Remember that I'm allergic to peanuts.")
+
+    def context(self, query: str, scope: str = "general", mm: MemoryManager | None = None) -> str:
+        mm = mm or self.mm
+        return mm.build_context(mm.recall(U, query, scope=scope))
+
+    def test_allergy_is_used_for_an_unrelated_question(self):
+        r = self.mm.recall(U, self.UNRELATED)
+        self.assertEqual({d.scored.memory.predicate: d.action for d in r.items}.get("allergy"), "USE")
+
+    def test_allergy_goes_in_its_own_section_with_a_safety_instruction(self):
+        ctx = self.context(self.UNRELATED)
+        self.assertIn("## Always respect (safety)\n- Allergic to peanuts", ctx)
+        self.assertIn("never suggest anything that conflicts with this", ctx)
+        self.assertNotIn("## Memories relevant to this message", ctx)   # Berlin isn't relevant here
+
+    def test_old_allergy_is_still_applied_not_questioned(self):
+        self.mm.clock.advance(400)
+        r = self.mm.recall(U, "Any snack ideas?")
+        self.assertEqual({d.scored.memory.predicate: d.action for d in r.items}.get("allergy"), "USE")
+
+    def test_allergies_do_not_take_top_k_slots(self):
+        mm = MemoryManager(store(), clock=self.mm.clock, config=MemoryConfig(top_k=1))
+        say(mm, "I live in Berlin.", "Remember that I'm allergic to peanuts.",
+            "Remember that I'm allergic to shellfish.")
+        r = mm.recall(U, "What's the weather like in Berlin?")
+        self.assertEqual(sorted(d.scored.memory.value for d in r.used), ["Berlin", "peanuts", "shellfish"])
+
+    def test_allergy_filed_as_personal_still_reaches_other_scopes(self):
+        mm = manager()
+        mm.add(U, [Candidate(kind="fact", predicate="allergy", value="peanuts", text="Allergic to peanuts",
+                             scope="personal", sensitive=True, explicit=True)])
+        for scope in ("work", "general", "personal"):
+            self.assertIn("Allergic to peanuts", self.context("Order lunch for the team", scope, mm))
+
+    def test_other_memories_still_respect_scope(self):
+        mm = manager()
+        mm.add(U, [Candidate(kind="fact", predicate="allergy", value="peanuts", text="Allergic to peanuts",
+                             scope="personal", sensitive=True, explicit=True),
+                   Candidate(kind="fact", predicate="relationship", value="divorce",
+                             text="Going through a divorce", scope="personal")])
+        self.assertNotIn("divorce", self.context("Going through my divorce paperwork", "work", mm))
+
+    def test_retracted_allergy_is_no_longer_included(self):
+        self.mm.add(U, [Candidate(kind="fact", predicate="allergy", value="peanuts",
+                                  text="No longer allergic to peanuts", negated=True)])
+        self.assertNotIn("peanuts", self.context("Any snack ideas?"))
+
+    def test_can_be_turned_off(self):
+        mm = MemoryManager(store(), clock=self.mm.clock, config=MemoryConfig(safety_predicates=set()))
+        say(mm, "Remember that I'm allergic to peanuts.")
+        self.assertNotIn("peanuts", self.context(self.UNRELATED, mm=mm))
 
 
 def log_text(mm: MemoryManager) -> str:

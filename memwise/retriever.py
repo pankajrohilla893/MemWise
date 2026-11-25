@@ -13,6 +13,10 @@ Two tiers:
 
 Only *current* memories are searched: superseded, retracted and expired rows
 are history, and must never reach the prompt as if they were still true.
+
+Safety memories (`MemoryConfig.safety_predicates`, allergies by default) are always
+returned, first, however unrelated they look, and don't count towards `top_k`; the
+surfacer then uses them in every scope.
 """
 
 from __future__ import annotations
@@ -59,16 +63,19 @@ def retrieve(store: MemoryStore, user_id: str, query: str, now: datetime,
              exclude: frozenset[str] | set[str] = frozenset()) -> list[Scored]:
     q = embedder.embed(query)
     w = config.weights
-    results = []
+    results: list[Scored] = []
+    safety: list[Scored] = []   # always returned, however unrelated they look
     for m in store.current(user_id, now):
         if m.id in exclude:
             continue
         rel = cosine(q, m.embedding)
-        if rel < config.min_relevance:
+        is_safety = m.predicate in config.safety_predicates
+        if rel < config.min_relevance and not is_safety:
             continue
         rec = recency(m, now, config.recency_half_life_days)
         score = (w["relevance"] * rel + w["recency"] * rec
                  + w["importance"] * m.importance + w["confidence"] * m.confidence)
-        results.append(Scored(m, rel, rec, score))
+        (safety if is_safety else results).append(Scored(m, rel, rec, score))
     results.sort(key=lambda s: s.score, reverse=True)
-    return results[: config.top_k]
+    safety.sort(key=lambda s: s.score, reverse=True)
+    return safety + results[: config.top_k]

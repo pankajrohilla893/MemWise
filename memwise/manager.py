@@ -128,7 +128,8 @@ class MemoryManager:
         """Find what's relevant to `query` and decide USE / MENTION / VERIFY / HOLD for each.
 
         `scope` is the context of this conversation ("general", "work", "personal",
-        or your own). Memories scoped to a different context are held back.
+        or your own). Memories scoped to a different context are held back. Safety
+        memories (allergies, by default) are always included, however unrelated they look.
         """
         with self._lock:
             now = self.clock.now()
@@ -155,16 +156,28 @@ class MemoryManager:
         now = self.clock.now()
         lines: list[str] = []
 
+        def heading(title: str) -> None:
+            lines.extend(["", title] if lines else [title])
+
         if recall.profile:
-            lines += ["## About the user (always loaded)"]
+            heading("## About the user (always loaded)")
             for m in recall.profile:
                 tag = " - follow this" if m.kind == "instruction" else ""
                 lines.append(f"- {m.text}{tag}")
 
-        if recall.used:
-            lines += ["", "## Memories relevant to this message"] if lines else \
-                     ["## Memories relevant to this message"]
-            for d in recall.used:
+        safety = [d for d in recall.used if d.scored.memory.predicate in self.config.safety_predicates]
+        relevant = [d for d in recall.used if d.scored.memory.predicate not in self.config.safety_predicates]
+
+        if safety:
+            heading("## Always respect (safety)")
+            for d in safety:
+                m = d.scored.memory
+                lines.append(f"- {m.text} (known since {m.valid_from:%Y-%m-%d}) -> never suggest "
+                             "anything that conflicts with this; only bring it up when it matters")
+
+        if relevant:
+            heading("## Memories relevant to this message")
+            for d in relevant:
                 m = d.scored.memory
                 since = f"known since {m.valid_from:%Y-%m-%d}"
                 if d.action == "USE":

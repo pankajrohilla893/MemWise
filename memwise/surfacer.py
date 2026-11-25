@@ -10,6 +10,11 @@ of four actions:
 
 HOLD matters most. A memory that isn't in the prompt can't leak, so the model
 never has to be trusted to "not mention" something.
+
+The one exception is safety memories (`MemoryConfig.safety_predicates`, allergies by
+default). Holding back "allergic to peanuts" because a dinner question scored as
+unrelated could hurt someone, so they are always USE, in every scope, however
+unrelated, old or uncertain they look. They stay in force until the user says otherwise.
 """
 
 from __future__ import annotations
@@ -32,6 +37,11 @@ class SurfaceDecision:
 def decide(s: Scored, scope: str, now: datetime,
            config: MemoryConfig = DEFAULT_CONFIG) -> SurfaceDecision:
     m = s.memory
+
+    # Checked before scope: an allergy filed under "personal" still matters when a work chat
+    # plans the team lunch, and models don't file allergies consistently.
+    if m.predicate in config.safety_predicates:
+        return SurfaceDecision(s, "USE", "safety: missing it could hurt the user, so it is never held back")
 
     # Context integrity: work memories stay out of personal chats and vice versa.
     if m.scope != "general" and scope != m.scope:

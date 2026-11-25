@@ -264,15 +264,19 @@ def stale_facts_get_checked(t: Run):
 def memory_shapes_the_answer(t: Run):
     t.session("Remember that I'm vegan.", "I'm allergic to peanuts, please remember that.",
               "Keep answers under 80 words.")
+    r = t.recall("Give me a quick dinner recipe idea.")
+    t.check("the allergy reaches the prompt", used(r, "peanut"), str(t.actions(r)))
     answer = t.reply("Give me a quick dinner recipe idea.")
+    # Ask so that "yes" means pass: with "Does it list peanuts?" (expecting no), the judge
+    # once reasoned "no peanuts" and then answered "yes", reading the question back to front.
     t.check("recipe is vegan",
-            not t.judge(answer, "Does the reply explicitly list meat, fish, eggs, dairy (milk, butter, "
-                                "cheese, yogurt, ghee) or honey as an ingredient? Plant-based milks "
-                                "don't count. Don't guess about ingredients it doesn't name."),
+            t.judge(answer, "Is every ingredient the reply names plant-based? Meat, fish, eggs, dairy "
+                            "(milk, butter, cheese, yogurt, ghee) and honey are not; plant-based milks "
+                            "are. Judge only the ingredients it names, and don't guess about others."),
             f"{answer[:250]} | judge: {t.last_judgement}")
     t.check("recipe has no peanuts",
-            not t.judge(answer, "Does the reply explicitly list peanuts or peanut butter as an "
-                                "ingredient? Chickpeas and other legumes are not peanuts."),
+            t.judge(answer, "Is the reply free of peanuts, meaning it doesn't list peanuts or peanut "
+                            "butter as an ingredient? Chickpeas and other legumes are not peanuts."),
             f"{answer[:250]} | judge: {t.last_judgement}")
     t.check("reply follows the length instruction", len(answer.split()) <= 110,
             f"{len(answer.split())} words")
@@ -404,6 +408,26 @@ def stored_memories_are_not_echoed(t: Run):
     t.check("nothing new stored", {m.id for m in t.current()} == set(before), t.memory_dump())
 
 
+def allergies_are_never_held_back(t: Run):
+    """Similarity can't tell a dinner question from a cover letter for "Allergic to shellfish",
+    so allergies always reach the prompt, and the instruction keeps them out of unrelated replies."""
+    t.session("Please remember I have a severe shellfish allergy.", "I live in Lisbon.")
+    for q in ["Plan a fun Saturday for me.", "What should I cook for friends this weekend?",
+              "Explain how TCP handshakes work."]:
+        t.check(f"allergy reaches the prompt for: {q}", used(t.recall(q), "shellfish"))
+    answer = t.reply("Suggest a dish for a seaside dinner by the coast.")
+    t.check("seafood dinner idea avoids shellfish",
+            t.judge(answer, "Is the reply free of shellfish, meaning it doesn't suggest shrimp, prawns, "
+                            "crab, lobster, mussels, clams, oysters, scallops or squid as something "
+                            "to eat? Fish such as cod or sardines is fine."),
+            f"{answer[:250]} | judge: {t.last_judgement}")
+    answer = t.reply("Explain how TCP handshakes work, in three sentences.")
+    t.check("an unrelated reply doesn't bring up the allergy",
+            t.judge(answer, "Does the reply stay on topic, without mentioning shellfish, allergies, "
+                            "food or the user's health?"),
+            f"{answer[:250]} | judge: {t.last_judgement}")
+
+
 SCENARIOS: list[Callable[[Run], None]] = [
     natural_phrasing, facts_change, retractions, sensitive_needs_consent, injection_in_pasted_text,
     other_people, hypotheticals_and_questions, temporary_situations_expire,
@@ -412,6 +436,7 @@ SCENARIOS: list[Callable[[Run], None]] = [
     other_languages, restating_does_not_duplicate, corrections, forget_request_in_chat,
     answers_to_assistant_questions, assistant_claims_are_not_user_facts,
     references_to_stored_memories, updates_reuse_stored_wording, stored_memories_are_not_echoed,
+    allergies_are_never_held_back,
 ]
 
 
