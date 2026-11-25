@@ -39,6 +39,7 @@ From GitHub:
 pip install "git+https://github.com/pankajrohilla893/MemWise.git"
 ```
 
+To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.2.0"`.
 There is nothing else to install. memwise and its built-in LLM client use only the Python
 standard library, so it works with whatever model provider you already use.
 
@@ -245,7 +246,7 @@ open the same SQLite file.
 | `ingest(user_id, messages)` | After a conversation. `messages` = the chat history (`{"role", "content"}` turns), or the user's messages as strings or `(source_ref, text)` pairs |
 | `add(user_id, candidates)` | Write memories you built yourself (a settings form, an import) |
 | `recall(user_id, message, scope="general")` | Before each model call. Returns a `Recall` |
-| `build_context(recall)` | The memory section for your system prompt (`""` if there's nothing to add) |
+| `build_context(recall)` | The memory section for your system prompt (`""` if there's nothing to add). `about="the project"` for memory that isn't about a person |
 | `current(user_id)` | "What do you know about me?" |
 | `history(user_id)` | Everything ever stored, including replaced and expired memories |
 | `forget(user_id, memory_id)` | Delete one memory and its older versions, and scrub it from the log |
@@ -366,6 +367,7 @@ back and never reach the prompt.
 | [`examples/demo.py`](examples/demo.py) | A guided story over 8 months of simulated time: write gate, superseding, expiry, staleness, forgetting, audit log |
 | [`examples/chat.py`](examples/chat.py) | An interactive chat with memory: type `/context` to see the prompt, `/log` to see every decision, `/advance 200` to jump ahead in time |
 | [`examples/tune_embedder.py`](examples/tune_embedder.py) | How your embedding model scores memories, and the thresholds to use with it |
+| [`examples/git_commits.py`](examples/git_commits.py) | Memory for a repository instead of a person: reads git commits and keeps the project's decisions, rules and lessons, with history ("Jest, then Vitest") and a link to each commit. `--ask "How should I cache sessions?"` answers with it |
 
 ```bash
 python examples/demo.py
@@ -384,6 +386,36 @@ python examples/chat.py
 
 The embedding model uses the same base URL and key unless you also set `MEMWISE_EMBED_BASE_URL`
 and `MEMWISE_EMBED_API_KEY`.
+
+### Not just people: memory for a repository
+
+The same machinery works for things other than a person. `examples/git_commits.py` reads a
+repo's commits and keeps what a new developer should know. Only the extraction prompt changes:
+
+```bash
+python examples/git_commits.py path/to/repo --ask "How should I cache user sessions?"
+```
+
+```text
+What shopfront knows (15):
+  episode     Redis ran out of memory under peak production load; sessions returned to PostgreSQL  [84054161ee, 2025-02-21]
+  fact        Uses PostgreSQL as the main database; orders and payments need transactions  [57eccb9e5b, 2025-01-08]
+  fact        Uses Vitest for tests; it runs faster and works with the ESM build  [7fdb4cdd1a, 2025-05-20]
+  instruction Never commit .env files; secrets are loaded from AWS Secrets Manager at startup  [3d2f49a8be, 2025-04-02]
+  ...
+No longer true (kept as history):
+  Uses Jest for unit tests  [2025-01-10 to 2025-05-20]
+  Hosted on Fly.io  [2025-03-03 to 2025-06-16]
+
+> How should I cache user sessions?
+Use PostgreSQL for sessions. Redis ran out of memory at peak load, and the project decided not to
+bring Redis back until a properly sized cluster is available.
+```
+
+Routine commits ("fix typo", "bump version") leave no memory, a commit telling "AI assistants"
+what to remember is ignored, and each run reads only new commits. The memory is kept inside
+`.git`, so it is never committed. It stores conclusions, not history: to find which commit
+changed a file, use `git log`.
 
 ## Test it with your model
 
@@ -429,7 +461,7 @@ read paths, maintenance, deletion, and how memory differs from RAG.
 
 ## Status and limitations
 
-This is an early release (0.1). Things to know before relying on it:
+This is an early release (0.2). Things to know before relying on it:
 
 - **`RuleExtractor`** only understands a fixed list of English phrasings. Use it for tests and
   demos, and an LLM extractor in production.

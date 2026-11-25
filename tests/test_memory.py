@@ -184,6 +184,11 @@ class ReadPath(unittest.TestCase):
         acts = self.actions("I'm stressed about work, how do I relax this weekend?", "personal")
         self.assertEqual(acts.get("employer"), "HOLD")
 
+    def test_context_can_be_about_something_other_than_a_person(self):
+        r = self.mm.recall(U, "Any snack ideas?")
+        self.assertIn("## About the user (always loaded)", self.mm.build_context(r))
+        self.assertIn("## About the project (always loaded)", self.mm.build_context(r, about="the project"))
+
     def test_held_memories_never_reach_the_prompt(self):
         r = self.mm.recall(U, "I'm stressed about work, how do I relax?", scope="personal")
         self.assertNotIn("Acme", self.mm.build_context(r))

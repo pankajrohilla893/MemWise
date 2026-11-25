@@ -147,11 +147,14 @@ class MemoryManager:
                     self.store.save(m)
             return result
 
-    def build_context(self, recall: Recall, include_guidelines: bool = True) -> str:
+    def build_context(self, recall: Recall, include_guidelines: bool = True, *,
+                      about: str = "the user") -> str:
         """Render the memory section for your system prompt. HOLD items are simply absent.
 
         Returns an empty string when there is nothing to say, so you can always
-        append it: `system = MY_PROMPT + "\\n\\n" + mm.build_context(r)`.
+        append it: `system = MY_PROMPT + "\\n\\n" + mm.build_context(r)`. `about` names
+        whose memory it is, for memory about something other than a person
+        (`about="the project"` for a repository).
         """
         now = self.clock.now()
         lines: list[str] = []
@@ -160,7 +163,7 @@ class MemoryManager:
             lines.extend(["", title] if lines else [title])
 
         if recall.profile:
-            heading("## About the user (always loaded)")
+            heading(f"## About {about} (always loaded)")
             for m in recall.profile:
                 tag = " - follow this" if m.kind == "instruction" else ""
                 lines.append(f"- {m.text}{tag}")

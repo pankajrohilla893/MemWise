@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-26)
 
 - **Allergies are never held back.** A consented "allergic to peanuts" scored just below the bar
   for sensitive memories against "Give me a quick dinner recipe idea", was held back, and a model
@@ -11,6 +11,11 @@
 - Scenario evals: a new `allergies_are_never_held_back` scenario (24 in all), a check that the
   allergy reaches the prompt in `memory_shapes_the_answer`, and judge questions phrased so that
   "yes" means pass (the judge once reasoned "no peanuts" and then answered "yes")
+- `examples/git_commits.py`: memory for a repository instead of a person. It reads git commits
+  (only new ones on each run) and keeps decisions, rules and lessons, each saved at its commit's
+  date and linked to its hash, so replacements keep their history ("Jest, then Vitest"). On a
+  24-commit test repo with gpt-6-luna it passed 19/19 checks in 5 of 5 runs
+- `build_context(recall, about="the project")` for memory that isn't about a person
 
 ## 0.1.0 (2026-11-26)
 
