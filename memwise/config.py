@@ -23,7 +23,7 @@ from typing import Any
 
 
 def _default_single_valued() -> set[str]:
-    return {"name", "lives_in", "employer", "job_title", "current_project", "traveling_to",
+    return {"name", "lives_in", "address", "employer", "job_title", "current_project", "traveling_to",
             "response_style", "diet"}
 
 
@@ -39,6 +39,9 @@ class MemoryConfig:
     duplicate_similarity: float = 0.85
     # Sensitive details (health, money, ...) are stored only if the user asked explicitly.
     require_consent_for_sensitive: bool = True
+    # Card numbers, passwords, PINs, API keys, bank account and ID numbers are never stored, even
+    # when the user asks, and never written to the audit log (see reconciler.secret_kind).
+    block_secrets: bool = True
     # Inferred (not stated) memories below this confidence are dropped.
     min_inferred_confidence: float = 0.6
     # Candidates below this importance are dropped unless the user asked explicitly.
@@ -49,7 +52,8 @@ class MemoryConfig:
     # Lasting facts never get an expiry date, even if the extractor proposes one: they change
     # when the user says so, and get re-checked when old (see stale_after_days).
     lasting_predicates: set[str] = field(default_factory=lambda: {
-        "name", "lives_in", "employer", "job_title", "response_style", "diet", "allergy", "health"})
+        "name", "lives_in", "address", "employer", "job_title", "response_style", "diet", "allergy",
+        "health"})
 
     # ---- read path (retriever) ------------------------------------------
     weights: dict[str, float] = field(default_factory=lambda: {

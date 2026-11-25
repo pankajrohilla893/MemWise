@@ -77,10 +77,11 @@ class Run:
     def recall(self, query: str, scope: str = "general", user: str = U):
         return self.mm.recall(user, query, scope=scope)
 
-    def reply(self, query: str, scope: str = "general", user: str = U) -> str:
+    def reply(self, query: str, scope: str = "general", user: str = U,
+              system: str = "You are a helpful assistant.") -> str:
         r = self.recall(query, scope, user)
-        system = "You are a helpful assistant.\n\n" + self.mm.build_context(r)
-        return self.llm(system, [{"role": "user", "content": query}])
+        prompt = system + "\n\n" + self.mm.build_context(r)
+        return self.llm(prompt, [{"role": "user", "content": query}])
 
     def judge(self, reply: str, question: str) -> bool:
         """Ask the model a yes/no question about a reply. A line of reasoning first makes it
@@ -453,8 +454,10 @@ def run_one(scenario, llm, embedder, config, context=True) -> tuple[str, list[tu
     return scenario.__name__, t.checks, time.time() - start, error
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+def main(scenarios: list[Callable[[Run], None]] | None = None, description: str | None = None) -> None:
+    """Run `scenarios` (default: the general ones above). Product evals reuse this runner."""
+    parser = argparse.ArgumentParser(description=description or __doc__,
+                                     formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--repeat", type=int, default=1, help="runs per scenario (default 1)")
     parser.add_argument("--only", default="", help="run scenarios whose name contains this")
     parser.add_argument("--workers", type=int, default=6, help="scenarios run in parallel (default 6)")
@@ -468,7 +471,7 @@ def main() -> None:
     except LLMError as e:
         sys.exit(str(e))
     config = MemoryConfig.for_embedding_model() if embedder else MemoryConfig()
-    chosen = [s for s in SCENARIOS if args.only in s.__name__]
+    chosen = [s for s in (scenarios or SCENARIOS) if args.only in s.__name__]
     print(f"chat model: {llm.model}   embeddings: {embedder.model if embedder else 'built-in'}   "
           f"scenarios: {len(chosen)} x {args.repeat}" + ("   (no context)" if args.no_context else "") + "\n")
 

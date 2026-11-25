@@ -82,6 +82,9 @@ JSON it returns. Both return the same type, so everything after this step is ide
 ### 2. The write gate decides what's worth keeping
 
 `write_gate()` in `reconciler.py` drops a candidate when:
+- it contains a **secret**: a card number (checked with the Luhn algorithm), a stated password,
+  PIN or security code, an API key, a bank account or ID number. These are refused even when the
+  user asks, and redacted from the audit log;
 - it's **sensitive** and the user didn't explicitly ask to remember it (consent);
 - it's an **inferred** guess with low confidence;
 - it has **low importance** and wasn't explicit.

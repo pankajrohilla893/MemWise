@@ -39,7 +39,7 @@ From GitHub:
 pip install "git+https://github.com/pankajrohilla893/MemWise.git"
 ```
 
-To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.2.0"`.
+To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.3.0"`.
 There is nothing else to install. memwise and its built-in LLM client use only the Python
 standard library, so it works with whatever model provider you already use.
 
@@ -433,7 +433,14 @@ python evals/scenarios.py --repeat 3   # three runs each, to find flaky behaviou
 ```
 
 Models don't answer the same way every time, so run with `--repeat` before trusting a result.
-Add scenarios from your own product to [`evals/scenarios.py`](evals/scenarios.py).
+Add scenarios from your own product to [`evals/scenarios.py`](evals/scenarios.py), or start a
+file for your product like [`evals/support_bot.py`](evals/support_bot.py): 10 scenarios for a
+store's support assistant (customers kept apart, card numbers refused, a damaged delivery that
+shapes the next order, an address change, fraud in a pasted email, "delete my data").
+
+```bash
+python evals/support_bot.py --repeat 3
+```
 
 ## How it works
 
@@ -444,6 +451,10 @@ read paths, maintenance, deletion, and how memory differs from RAG.
 
 - **Consent for sensitive data.** Health and other sensitive details are only stored if the user
   explicitly asks. They are never part of the always-loaded profile.
+- **Secrets are never stored.** Card numbers, security codes, passwords, PINs, API keys, bank
+  account and ID numbers are refused by the write gate even when the user says "remember my card",
+  and are redacted from the audit log. This doesn't rely on the model: it's a check in memwise
+  itself, tuned to keep lookalikes such as "Never commit API keys" or "Visa card ending 4242".
 - **Held-back memories are never sent.** HOLD items aren't in the prompt at all, so the model
   can't leak them.
 - **Allergies are never held back.** Similarity scores can't reliably tell "dinner ideas" from
@@ -461,7 +472,7 @@ read paths, maintenance, deletion, and how memory differs from RAG.
 
 ## Status and limitations
 
-This is an early release (0.2). Things to know before relying on it:
+This is an early release (0.3). Things to know before relying on it:
 
 - **`RuleExtractor`** only understands a fixed list of English phrasings. Use it for tests and
   demos, and an LLM extractor in production.

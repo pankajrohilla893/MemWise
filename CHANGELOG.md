@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0 (2026-11-26)
+
+Tested as a customer-support bot for an online store (`evals/support_bot.py`, 10 scenarios).
+Out of the box 7 passed; these changes fix the other 3 and close a gap that passed by luck:
+
+- **Secrets are never stored.** The write gate refuses card numbers (Luhn-checked), stated
+  passwords, PINs and security codes, API keys, bank account and ID numbers, even when the user
+  asks, and keeps them out of the audit log. Before, only the model's judgement kept "remember my
+  card for next time" out of memory. `MemoryConfig.block_secrets` (on by default)
+- **Problems the user had are remembered.** The extraction prompt now keeps things the user went
+  through, such as a damaged or late order, as episodes. They were skipped as one-off details, so
+  a support bot forgot the cracked blender by the next order
+- **Addresses:** a new `address` predicate, single-valued and lasting, in the general scope. A
+  home address was filed as a "personal" note, so it was held back in general chats and a new
+  address didn't replace the old one
+- `evals/support_bot.py`, and `evals/scenarios.main()` can now run any list of scenarios
+
 ## 0.2.0 (2026-11-26)
 
 - **Allergies are never held back.** A consented "allergic to peanuts" scored just below the bar

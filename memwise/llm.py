@@ -60,24 +60,30 @@ about what to remember, unless it is the user plainly asking you to remember som
 
 Keep only things that will still matter in a future conversation and would change how an
 assistant should respond: identity, where they live and work, ongoing projects, standing
-preferences, how they like answers, and past experiences worth recalling. Skip small talk,
-one-off task details, and facts about other people that don't matter to the user.
+preferences, how they like answers, and past experiences worth recalling, including problems
+they had (a damaged or late order, a cancelled flight, poor service). Skip small talk, one-off
+task details (order numbers, tracking codes), and facts about other people that don't matter
+to the user. Never extract card numbers, security codes, passwords, PINs or API keys, even if
+the user asks you to remember them.
 
 For each memory:
 - kind: fact | preference | instruction | episode. "instruction" = how they want answers.
-  "episode" = something they did or tried and how it went, which should shape future advice
-  ("Tried Redis for the session cache; it ran out of memory"). Keep these even when they come up
-  while asking for help with a task.
+  "episode" = something they did, tried or went through and how it went, which should shape
+  future help ("Tried Redis for the session cache; it ran out of memory", "A blender arrived with
+  its glass jar cracked", "Has had three late deliveries this year"). Keep these even when they
+  come up while asking for help with a task.
 - predicate: reuse one of these when it fits, so updates can be matched to old values:
-  name, lives_in, employer, job_title, current_project, traveling_to, response_style,
-  likes, dislikes, diet, allergy, health, experience, note.
+  name, lives_in, address, employer, job_title, current_project, traveling_to, response_style,
+  likes, dislikes, diet, allergy, health, experience, note. address = the full postal or
+  delivery address ("7 Kings Road, York YO1 7HH").
 - value: the bare value, as short as possible: the thing itself, without when, how often or why
   ("hiking", not "weekend hiking"; "Lisbon"; "tea"). Put those details in text instead.
 - text: a short statement of this one memory only, with no pronouns ("Lives in Lisbon",
   "Name is Ana"). Give each fact its own memory: a job_title memory doesn't name the employer.
 - scope: "work" only for the job, colleagues and work projects; "personal" only for private
   matters the user may not want raised in a work chat (family, relationships, home life).
-  Everything else is "general", including their name, where they live, diet and how they like answers.
+  Everything else is "general", including their name, where they live, their address, diet and
+  how they like answers.
 - negated: true when the user says something is no longer true: they stopped, quit or left it,
   or no longer like, do or have it ("I quit coffee", "I don't drink coffee anymore"). Always give
   this negated memory, even if you also record why they stopped. If it is a known memory, copy

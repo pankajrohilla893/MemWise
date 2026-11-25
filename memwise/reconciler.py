@@ -20,6 +20,7 @@ contradict, refine, or repeat A?".
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -50,8 +51,56 @@ def _same(a: str, b: str) -> bool:
     return a.strip().lower() == b.strip().lower()
 
 
+# ---- secrets: never stored, whatever the model proposes and even if the user asks -----------
+# Memory is the wrong place for credentials, and a model told "remember my card for next time"
+# may comply. These patterns look for the secret itself, not the topic: "Never commit API keys"
+# and "Prefers a password manager" are fine to keep, "password is Sunflower!2024" is not.
+_CARD = re.compile(r"(?<![\d-])[3-6](?:[ -]?\d){12,18}(?![\d-])")
+_TOKEN = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|"
+                    r"xox[abposr]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,})")
+_SECRET_STATED = re.compile(
+    r"\b(?:pass(?:word|code|phrase)|cvv2?|cvc|security code|api key|secret key|access token|"
+    r"one-time code)s?\s*(?:is|was|=|:)\s*\S{3,}"
+    r"|\b(?:pin|cvv2?|cvc|security code)s?\s*(?:code|number)?\s*(?:is|was|=|:)?\s*#?\d{3,}", re.I)
+_SECRET_PREDICATE = re.compile(
+    r"(?:^|_)(?:password|passcode|passphrase|pin|cvv|cvc|security_code|api_?key|secret_key|"
+    r"access_token|token|iban|ssn|account_number|card_number)(?:$|_)", re.I)
+_IBAN = re.compile(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b")
+_SSN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+
+
+def _luhn(digits: str) -> bool:
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        n = int(d) * (2 if i % 2 else 1)
+        total += n - 9 if n > 9 else n
+    return total % 10 == 0
+
+
+def secret_kind(c: Candidate) -> str | None:
+    """What kind of secret this candidate contains ("a card number", ...), or None."""
+    text = f"{c.value}\n{c.text}"
+    for m in _CARD.finditer(text):
+        digits = re.sub(r"\D", "", m.group())
+        if 13 <= len(digits) <= 19 and _luhn(digits):
+            return "a card number"
+    if _TOKEN.search(text):
+        return "an API key or token"
+    if _SECRET_STATED.search(text) or _SECRET_PREDICATE.search(c.predicate):
+        return "a password, PIN or security code"
+    if _IBAN.search(text):
+        return "a bank account number"
+    if _SSN.search(text):
+        return "a government ID number"
+    return None
+
+
 def write_gate(c: Candidate, config: MemoryConfig = DEFAULT_CONFIG) -> str | None:
     """Return a reason to NOT store this candidate, or None to keep it."""
+    if config.block_secrets:
+        kind = secret_kind(c)
+        if kind:
+            return f"looks like {kind}; secrets are never stored, even when asked"
     if config.require_consent_for_sensitive and c.sensitive and not c.explicit:
         return "sensitive detail mentioned in passing; needs explicit consent ('remember that ...')"
     if c.source_kind == "inferred" and c.confidence < config.min_inferred_confidence:
@@ -130,7 +179,7 @@ def apply(d: Decision, store: MemoryStore, user_id: str, now: datetime,
 
     if d.op == "IGNORE":
         # Don't let the audit log keep what the write gate refused, or what the user wants forgotten.
-        what = f"[redacted {c.predicate}]" if c.sensitive or c.forget else repr(c.text)
+        what = f"[redacted {c.predicate}]" if c.sensitive or c.forget or secret_kind(c) else repr(c.text)
         store.log(user_id, now, "IGNORE", None, f"{what}: {d.reason}")
         return d
 

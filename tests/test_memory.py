@@ -275,6 +275,60 @@ class SafetyMemories(unittest.TestCase):
         self.assertNotIn("peanuts", self.context(self.UNRELATED, mm=mm))
 
 
+class Secrets(unittest.TestCase):
+    """Card numbers, passwords and keys never reach the store or the log, even when asked."""
+
+    def add(self, mm: MemoryManager, predicate: str, value: str, text: str, **kw):
+        [d] = mm.add(U, [Candidate(kind="fact", predicate=predicate, value=value, text=text, **kw)])
+        return d
+
+    def test_card_number_is_refused_even_when_the_user_asks(self):
+        mm = manager()
+        d = self.add(mm, "payment_card", "4242 4242 4242 4242", "Card number 4242 4242 4242 4242",
+                     explicit=True, sensitive=True)
+        self.assertEqual(d.op, "IGNORE")
+        self.assertIn("never stored", d.reason)
+        self.assertEqual(mm.current(U), [])
+        self.assertNotIn("4242", log_text(mm))
+
+    def test_password_is_refused_by_its_predicate_alone(self):
+        mm = manager()
+        self.assertEqual(self.add(mm, "password", "Sunflower!2024", "Account password", explicit=True).op,
+                         "IGNORE")
+        self.assertNotIn("sunflower", log_text(mm))
+
+    def test_api_key_and_bank_details_are_refused(self):
+        mm = manager()
+        for value in ("sk-proj-abcdefghijklmnop1234", "GB82 WEST 1234 5698 7654 32"):
+            self.assertEqual(self.add(mm, "note", value, f"Remember {value}", explicit=True).op, "IGNORE")
+
+    def test_a_retracted_secret_is_not_logged_either(self):
+        mm = manager()
+        self.add(mm, "note", "Sunflower!2024", "Old password is Sunflower!2024", negated=True)
+        self.assertNotIn("sunflower", log_text(mm))
+
+    def test_lookalikes_are_kept(self):
+        mm = manager()
+        for text in ("Never commit API keys to the repo", "Prefers a password manager",
+                     "Uses a rolling pin for pastry", "Prefers the Visa card ending 4242"):
+            self.assertNotEqual(self.add(mm, "note", text, text).op, "IGNORE", text)
+
+    def test_can_be_turned_off(self):
+        mm = MemoryManager(store(), config=MemoryConfig(block_secrets=False))
+        self.assertEqual(self.add(mm, "note", "PIN 4821", "Door PIN 4821", explicit=True).op, "ADD")
+
+
+class Addresses(unittest.TestCase):
+    def test_a_new_address_replaces_the_old_one(self):
+        mm = manager()
+        mm.add(U, [Candidate(kind="fact", predicate="address", value="14 Rose Street, Leeds",
+                             text="Address is 14 Rose Street, Leeds")])
+        [d] = mm.add(U, [Candidate(kind="fact", predicate="address", value="7 Kings Road, York",
+                                   text="Address is 7 Kings Road, York")])
+        self.assertEqual(d.op, "SUPERSEDE")
+        self.assertEqual(current_values(mm, "address"), ["7 Kings Road, York"])
+
+
 def log_text(mm: MemoryManager) -> str:
     return " ".join(str(dict(row)) for row in mm.store.logs(U)).lower()
 
