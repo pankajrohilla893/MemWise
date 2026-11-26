@@ -79,6 +79,32 @@ scores 89.7, 2.8 points lower, with 4,899 tokens: **30% fewer**. Mem0 measured w
 models and grader, so this isn't a controlled comparison: some of the gap may come from the
 models rather than the memory.
 
+### How good is 89.7?
+
+A LoCoMo score depends a lot on the answer model and the grader, so it means most next to fixed
+reference points:
+
+| Compared with | Score | What it tells you |
+|---|---|---|
+| The whole conversation, same model | about 93 (estimated) | The ceiling for this model, which then reads everything. memwise reaches 96% of it with about a fifth of the text |
+| The best any system can score | about 96 | From a review of memwise's misses, about 3.5 points of LoCoMo have an expected answer that is wrong or ambiguous, or are graded too strictly. No memory can win those back |
+
+The 93 is estimated from the whole-conversation run on the 382 questions above (multi-hop 94.0,
+temporal 92.0, open-domain 67.1, single-hop 96.0), weighted by how many questions of each type
+the full set has.
+
+**Where it does well:** single facts (93.1), several facts together (90.4) and dates (87.5), at
+a fraction of the tokens, and that cost stays flat however long the history grows.
+
+**Where it's weak:**
+
+- **Open-domain, 65.6.** These need an inference or world knowledge ("Would he prefer a Dodge
+  Charger or a Subaru Forester?"). The whole conversation scores about the same on them (67.1 in
+  the sample), so this is mostly the answer model's limit, not the memory's.
+- **Counting and durations, 74.6** (71 questions starting "How many", "How often" or "How
+  long"). Every instance has to be found, often across many sessions, and one missed mention
+  changes the answer.
+
 ### How it was measured
 
 - Each friend gets their own memwise. Every session goes in, in order, with its date. memwise
