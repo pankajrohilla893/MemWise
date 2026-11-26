@@ -82,7 +82,7 @@ RESULTS_DIR = HERE / "data" / "locomo-results"
 
 CATEGORIES = {1: "multi-hop", 2: "temporal", 3: "open-domain", 4: "single-hop", 5: "adversarial"}
 NOT_MENTIONED = "Not mentioned: nothing in the chats says this about that person"
-INGEST_FORMAT = "3"  # bump when Memory.build or LLMExtractor changes what the extractor sees
+INGEST_FORMAT = "4"  # bump when Memory.build, LLMExtractor or the reconciler's rules change what is built
 
 # --prompt friends: memwise's prompt is written for an assistant and its user, and skips one-off
 # events. LoCoMo asks about exactly those, so this keeps them, with dates.

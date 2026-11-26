@@ -112,6 +112,11 @@ JSON it returns. Both return the same type, so everything after this step is ide
 instead of being overwritten, so you can always answer "where did they used to live?" and
 explain why a memory changed. Every operation is written to the audit log.
 
+Projects (`current_project`) are not single-valued: people work on several at once (an album, a
+tour, growing a brand), and a new one doesn't end the others. A project ends when the user says
+it's finished or dropped (**RETRACT**), when its expiry passes, or when the judge says a new one
+replaces it.
+
 ### 4. Optional: a judge for what the rules can't see
 
 The rules only compare memories that share a predicate, so "Went vegetarian" (`diet`) is added

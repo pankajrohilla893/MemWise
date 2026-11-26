@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.1 (2026-11-26)
+
+A fix: a new project no longer closes the projects before it.
+
+- **Several projects can be current at once.** `current_project` is no longer single-valued, so
+  a new project doesn't close the ones before it. Before, each project replaced the last: in the
+  LoCoMo benchmark, a musician's studio, his plan to grow his brand worldwide, his tour and his
+  album each closed the one before, and asked "Does Calvin want to expand his brand?" the model
+  read "no longer true" and said no. 72 project memories were closed this way. A project now ends when
+  the user says it's finished or dropped (the built-in prompt asks for a negated memory, and
+  `RuleExtractor` understands "I've finished working on X" and "I'm no longer working on X"),
+  when its expiry passes, or when the judge says a new one replaces it. To keep one project at a
+  time, `config.single_valued.add("current_project")`. On LoCoMo the overall score is unchanged
+  within noise (89.4 against 89.7 on all 1,540 questions, with a rebuilt memory); questions about
+  projects went from 85.7% to 87.3%, and memories of any kind closed by a newer one fell from 78 to 5
+- **LoCoMo:** the build format is now "4", so the benchmark builds its memory again with the
+  new rule instead of reusing an old build
+
 ## 0.5.0 (2026-11-26)
 
 Memory that keeps what the user said word for word, works out relative dates, can rewrite a

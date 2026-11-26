@@ -104,7 +104,7 @@ From GitHub:
 pip install "git+https://github.com/pankajrohilla893/MemWise.git"
 ```
 
-To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.5.0"`.
+To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.5.1"`.
 There is nothing else to install. memwise and its built-in LLM client use only the Python
 standard library, so it works with whatever model provider you already use.
 
@@ -455,7 +455,10 @@ config.single_valued |= {"apron_size", "glove_size", "delivery_slot"}   # a new 
 - **`scopes`** are the contexts your product uses. A memory with any other scope is filed as
   "general". Pass the same names to `recall(user_id, message, scope="orders")`.
 - **New predicates** that hold one value at a time go in `config.single_valued`, as above.
-  Otherwise a new size is added next to the old one instead of replacing it.
+  Otherwise a new size is added next to the old one instead of replacing it. Projects
+  (`current_project`) are not on that list, because people work on several at once: one ends
+  when the user says it's finished or dropped, when its expiry passes, or when the judge says a
+  new one replaces it. `config.single_valued.add("current_project")` keeps one at a time.
 - For a completely different job, write the whole prompt yourself.
   [`examples/git_commits.py`](examples/git_commits.py) does this to remember a repository instead
   of a person.

@@ -89,7 +89,9 @@ For each memory:
   name, lives_in, address, employer, job_title, current_project, traveling_to, response_style,
   likes, dislikes, diet, allergy, health, experience, note. lives_in = the city they live in or
   are based in. address = the full postal or delivery address ("7 Kings Road, York YO1 7HH"). diet = how they eat overall (vegetarian,
-  vegan, keto, halal), never a food or drink they like.
+  vegan, keto, halal), never a food or drink they like. current_project = something they are
+  working on or aiming for now; they can have several at once, so give each its own memory,
+  with the project as value, and give it negated when they finish or drop it.
 - value: the bare value, as short as possible: the thing itself, without when, how often or why
   ("hiking", not "weekend hiking"; "Lisbon"; "tea"). Put those details in text instead.
 - text: a short statement of this one memory only, with no pronouns ("Lives in Lisbon",

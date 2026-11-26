@@ -23,7 +23,10 @@ from typing import Any
 
 
 def _default_single_valued() -> set[str]:
-    return {"name", "lives_in", "address", "employer", "job_title", "current_project", "traveling_to",
+    # Not current_project: people work on several things at once (an album, a tour, growing a
+    # brand), and a new one doesn't end the others. A project ends when the user says it's done
+    # (a negated memory), when its expiry passes, or when the judge says the new one replaces it.
+    return {"name", "lives_in", "address", "employer", "job_title", "traveling_to",
             "response_style", "diet"}
 
 

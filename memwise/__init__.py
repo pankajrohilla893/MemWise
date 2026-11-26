@@ -44,7 +44,7 @@ from .retriever import Rewriter, ScoredMessage
 from .store import MemoryStore
 from .surfacer import SurfaceDecision
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "Candidate",

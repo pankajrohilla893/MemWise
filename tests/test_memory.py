@@ -131,6 +131,28 @@ class WritePath(unittest.TestCase):
         self.assertEqual(d.op, "SUPERSEDE")
         self.assertEqual(current_values(mm, "diet"), ["eats meat"])
 
+    def test_several_projects_can_be_current_at_once(self):
+        mm = manager()
+        say(mm, "I'm working on the billing redesign.")
+        mm.clock.advance(5)
+        [d] = say(mm, "I'm working on a mobile app.")
+        self.assertEqual(d.op, "ADD")                     # a new project doesn't end the first
+        self.assertEqual(sorted(current_values(mm, "current_project")), ["billing redesign", "mobile app"])
+        [d] = say(mm, "I'm working on the billing redesign, still.")
+        self.assertEqual(d.op, "CONFIRM")
+
+    def test_finishing_a_project_closes_only_that_one(self):
+        mm = manager()
+        say(mm, "I'm working on the billing redesign.")
+        say(mm, "I'm working on a mobile app.")
+        mm.clock.advance(20)
+        [d] = say(mm, "I've finished working on the billing redesign!")
+        self.assertEqual(d.op, "RETRACT")
+        self.assertEqual(current_values(mm, "current_project"), ["mobile app"])
+        [d] = say(mm, "I'm no longer working on the mobile app.")
+        self.assertEqual(d.op, "RETRACT")
+        self.assertEqual(current_values(mm, "current_project"), [])
+
     def test_sensitive_needs_explicit_consent(self):
         mm = manager()
         [d] = say(mm, "I was diagnosed with diabetes last year.")

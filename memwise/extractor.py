@@ -88,6 +88,13 @@ PATTERNS: list[tuple[str, Builder]] = [
      lambda m: Candidate("fact", "current_project", _clean(m.group(1)),
                          f"Working on {_clean(m.group(1))}", scope="work", importance=0.5,
                          ttl_days=45)),
+    # Several projects can be current at once, so one ends only when the user says so.
+    (r"\bi(?:'ve| have)? (?:stopped|finished|quit) working on (?:the |a |an )?([\w -]+?)" + _END,
+     lambda m: Candidate("fact", "current_project", _clean(m.group(1)),
+                         f"Working on {_clean(m.group(1))}", scope="work", negated=True)),
+    (r"\bi(?:'m| am) no longer working on (?:the |a |an )?([\w -]+?)" + _END,
+     lambda m: Candidate("fact", "current_project", _clean(m.group(1)),
+                         f"Working on {_clean(m.group(1))}", scope="work", negated=True)),
     (r"\bi(?:'m| am) (?:traveling|travelling|flying|heading) to ([A-Za-z][\w-]*)"
      r"(?:[^.!?]*?\b(tomorrow|this week|next week|next month))?", _travel),
 
