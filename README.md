@@ -661,7 +661,24 @@ python evals/scenarios.py --judge
 the long-conversation benchmark that Mem0 and others quote. It has 10 chats between two friends,
 each spanning months (19 to 32 sessions), and 1,540 questions about them, plus 446 adversarial
 ones. Each friend gets their own memory, a model answers from what memwise recalls, and the
-same model grades the answer. The data isn't included, so download it once (2.8 MB):
+same model grades the answer.
+
+**Result:** 89.7 out of 100 on all 1,540 questions, with about 4,900 tokens of memory per
+question.
+
+**What it saves:** sending the whole conversation instead takes 22,069 tokens per question. On
+the same 382 questions, memwise uses **78% fewer tokens** (4,809) and scores 85.3, against 88.2
+for the whole conversation. Models bill input by the token, so the memory part of each call costs
+78% less: at an example $1 per million input tokens, 1,000 questions cost $4.81 instead of
+$22.07. Against Mem0's published 92.5 at 6,956 tokens per query, memwise uses 30% fewer tokens
+and scores 2.8 points lower (Mem0 used its own models and grader, so this isn't a controlled
+comparison).
+
+The complete results, with charts by question type, are on the
+[results page](docs/benchmarks.html) (download it and open it in a browser). See also
+[Benchmark results](#benchmark-results) above.
+
+The data isn't included, so download it once (2.8 MB):
 
 ```bash
 mkdir -p evals/data
