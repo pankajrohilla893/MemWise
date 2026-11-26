@@ -430,6 +430,117 @@ class KeptMessages(unittest.TestCase):
         self.assertEqual(after.embedding, mm.embedder.embed("Nice weather today."))
 
 
+def chat(mm: MemoryManager, *texts: str):
+    """A chat: the user's line, the assistant's reply, the user's line, ..."""
+    return mm.ingest(U, [{"role": "user" if i % 2 == 0 else "assistant", "content": t}
+                         for i, t in enumerate(texts)])
+
+
+class KeptAssistantMessages(unittest.TestCase):
+    """MemoryConfig.keep_assistant_messages: what the assistant replied, word for word."""
+
+    def replies(self, mm: MemoryManager) -> list[str]:
+        return [s.text for s in mm.store.messages(U) if s.role == "assistant"]
+
+    def test_off_by_default(self):
+        mm = keeping()
+        chat(mm, "Can you recommend a hostel in Amsterdam?", "Try the International Budget Hostel.")
+        self.assertEqual(self.replies(mm), [])
+        self.assertEqual(mm.recall(U, "Which hostel did you recommend?").assistant_messages, [])
+
+    def test_a_reply_is_recalled_and_never_becomes_a_memory(self):
+        mm = keeping(keep_assistant_messages=True)
+        chat(mm, "I live in Berlin. Can you recommend a hostel in Amsterdam near the Red Light District?",
+             "I'd suggest the International Budget Hostel: it's cheap and central.",
+             "Thanks!", "You're welcome. Enjoy the canals!")
+        mm.clock.advance(5)
+        say(mm, "I like jazz.")
+        [s, _] = [x for x in mm.store.messages(U) if x.role == "assistant"]
+        self.assertEqual((s.ref, s.memory_ids), ("a2", []))
+        self.assertEqual(current_values(mm, "lives_in"), ["Berlin"])
+        self.assertFalse(any("Hostel" in m.text for m in mm.history(U)))
+        r = mm.recall(U, "What was the name of the hostel in Amsterdam you recommended?")
+        self.assertEqual(r.assistant_messages[0].message.text,
+                         "I'd suggest the International Budget Hostel: it's cheap and central.")
+        self.assertNotIn("Hostel", " ".join(x.message.text for x in r.messages))  # not the user's words
+        context = mm.build_context(r)
+        self.assertIn("## What you told the user before (your own replies", context)
+        self.assertIn('- Thursday 2026-01-01: "I\'d suggest the International Budget Hostel', context)
+        self.assertIn("they may have been wrong", context)
+        self.assertEqual(len(keeping(keep_assistant_messages=True, assistant_message_top_k=0)
+                             .recall(U, "Which hostel?").assistant_messages), 0)
+
+    def test_without_keeping_the_users_messages(self):
+        mm = MemoryManager(store(), clock=Clock(fixed_start=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                           config=MemoryConfig(keep_assistant_messages=True))
+        chat(mm, "I live in Berlin. Any museum tips?", "The Pergamon Museum is a must.")
+        self.assertEqual([(s.role, s.text) for s in mm.store.messages(U)],
+                         [("assistant", "The Pergamon Museum is a must.")])
+        r = mm.recall(U, "Which museum did you suggest?")
+        self.assertEqual([x.message.text for x in r.assistant_messages], ["The Pergamon Museum is a must."])
+        self.assertEqual(r.messages, [])
+
+    def test_long_replies_are_kept_in_pieces(self):
+        mm = keeping(keep_assistant_messages=True, assistant_piece_chars=60)
+        reply = "Here are some parameters:\n" + "\n".join(f"{n}. Parameter number {n}" for n in range(1, 11))
+        chat(mm, "List some prompt parameters.", reply)
+        pieces = [s for s in mm.store.messages(U) if s.role == "assistant"]
+        self.assertGreater(len(pieces), 2)
+        self.assertTrue(all(len(s.text) <= 60 for s in pieces))
+        self.assertEqual([s.ref for s in pieces], [f"a2#{k}" for k in range(1, len(pieces) + 1)])
+        self.assertEqual("\n".join(s.text for s in pieces), reply)  # cut at line breaks, nothing lost
+        from memwise.manager import _pieces
+        long_line = " ".join(["word"] * 40)
+        cut = _pieces(long_line, 50)
+        self.assertTrue(all(len(x) <= 50 for x in cut))
+        self.assertEqual(" ".join(cut), long_line)
+
+    def test_a_reply_to_a_message_that_isnt_kept_isnt_kept(self):
+        mm = keeping(keep_assistant_messages=True)
+        chat(mm, "I was diagnosed with diabetes.", "I'm sorry about the diabetes; let's plan meals.",
+             "I live in Paris.", "Paris is lovely.")
+        self.assertEqual(self.replies(mm), ["Paris is lovely."])
+        chat(mm, "Please forget that I live in Paris.", "Done: I've forgotten that you live in Paris.")
+        self.assertEqual(self.replies(mm), [])  # forgetting Paris deleted the reply that named it
+        mm = keeping(keep_assistant_messages=True, require_consent_for_sensitive=False)
+        chat(mm, "I was diagnosed with diabetes.", "Let's plan meals that keep your sugar steady.")
+        [s] = [x for x in mm.store.messages(U) if x.role == "assistant"]
+        self.assertTrue(s.sensitive)  # like the message it answers
+        self.assertEqual(mm.recall(U, "Suggest a film").assistant_messages, [])
+
+    def test_work_replies_stay_at_work(self):
+        mm = keeping(keep_assistant_messages=True)
+        chat(mm, "I work at Acme, on the billing team.", "Got it: billing at Acme.")
+        [s] = [x for x in mm.store.messages(U) if x.role == "assistant"]
+        self.assertEqual(s.scope, "work")
+        self.assertEqual(mm.recall(U, "What did you say about billing at Acme?", scope="personal")
+                         .assistant_messages, [])
+
+    def test_forget_all_deletes_them(self):
+        mm = keeping(keep_assistant_messages=True)
+        chat(mm, "Any museum tips?", "The Pergamon Museum is a must.")
+        mm.forget_all(U)
+        self.assertEqual(mm.store.messages(U), [])
+
+    def test_a_file_from_before_gets_the_role_column(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "old.db")
+            db = sqlite3.connect(path)
+            db.executescript(
+                "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, ref TEXT NOT NULL, "
+                "at TEXT NOT NULL, text TEXT NOT NULL, scope TEXT NOT NULL, sensitive INTEGER NOT NULL, "
+                "memory_ids TEXT NOT NULL, embedding TEXT NOT NULL);"
+                "INSERT INTO messages VALUES ('s1', 'u1', 't0', '2026-01-01T00:00:00+00:00', 'Hi', "
+                "'general', 0, '[]', '[]');")
+            db.commit()
+            db.close()
+            s = MemoryStore(path)
+            [m] = s.messages(U)
+            self.assertEqual((m.text, m.role), ("Hi", "user"))
+            s.close()
+
+
 class RelativeDates(unittest.TestCase):
     """memwise.dates: "last weekend" said on a Monday is the weekend just gone, worked out in code."""
 

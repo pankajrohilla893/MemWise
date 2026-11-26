@@ -187,6 +187,14 @@ sensitive if one of them was. At recall:
   are combined by reciprocal rank fusion, and the best `message_top_k` that pass the scope and
   sensitivity rules go in `Recall.messages`.
 
+With `MemoryConfig.keep_assistant_messages`, the assistant's replies are kept too, cut into
+pieces of at most `assistant_piece_chars` at line breaks (between words for a long line), with
+role "assistant" and no memories linked. They're never a source of memories about the user.
+Recall searches them on their own, with the same rankings, so they don't crowd out what the
+user said, and the best `assistant_message_top_k` go in `Recall.assistant_messages`. A reply
+takes the fate of the user message it answers: not kept if that message isn't, and kept with
+its scope and sensitivity.
+
 This is what extraction can't give: the details nobody knew would be asked about. In LoCoMo,
 "Where did Caroline move from?" is answered by a line about her grandmother's necklace "from my
 home country, Sweden", which no extracted memory kept.

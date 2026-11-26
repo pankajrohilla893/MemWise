@@ -30,9 +30,15 @@ BENCHMARKS = {
     "LongMemEval": "Long chat histories with questions on recall, multi-session reasoning, "
                    "knowledge updates, temporal reasoning and abstention.",
 }
-ORDER = ["single-hop", "multi-hop", "open-domain", "temporal", "adversarial"]
+ORDER = ["single-hop", "multi-hop", "open-domain", "temporal", "adversarial",  # LoCoMo
+         "single-session-user", "single-session-assistant", "single-session-preference",  # LongMemEval
+         "multi-session", "knowledge-update", "temporal-reasoning", "abstention"]
 NAMES = {"single-hop": "Single hop", "multi-hop": "Multi-hop", "open-domain": "Open-domain",
-         "temporal": "Temporal", "adversarial": "Adversarial"}
+         "temporal": "Temporal", "adversarial": "Adversarial",
+         "single-session-user": "What the user said", "single-session-assistant": "What the assistant said",
+         "single-session-preference": "Preference", "multi-session": "Multi-session",
+         "knowledge-update": "Knowledge update", "temporal-reasoning": "Temporal reasoning",
+         "abstention": "Abstention"}
 
 
 def e(text: Any) -> str:
@@ -111,6 +117,8 @@ LEGEND = ('<div class="legend"><span><i class="key memwise"></i>memwise</span>'
 
 def coverage(s: dict) -> str:
     convs, total = len(s["conversations"]), s.get("total_conversations", len(s["conversations"]))
+    if s["benchmark"] == "LongMemEval":  # every question has its own history
+        return f"{s['questions']:,} of {total} questions, each with its own history"
     which = "all conversations" if convs == total else f"{convs} of {total} conversations"
     return f"{s['questions']:,} questions · {which}"
 
@@ -221,7 +229,7 @@ def panel(name: str, b: dict, price: float = 1.0, refs: list[list[str]] | None =
              + "</tbody></table></details>")
 
     st = head["settings"]
-    facts = [f"Answers and grading: {st['chat_model']} ({st['grader']} grading, as in published results)"
+    facts = longmemeval_facts(head) if name == "LongMemEval" else [f"Answers and grading: {st['chat_model']} ({st['grader']} grading, as in published results)"
              if st["grader"] == "lenient" else f"Answers and grading: {st['chat_model']} ({st['grader']} grading)",
              f"Embeddings: {st['embed_model']}",
              f"Headline set-up: extraction prompt {st['prompt']}, sensitive details {st['sensitive']}, "
@@ -229,7 +237,7 @@ def panel(name: str, b: dict, price: float = 1.0, refs: list[list[str]] | None =
              + (f", messages kept and {st['message_top_k']} recalled per person" if st.get("keep_messages") else ""),
              "memwise and full context answer with the same model and prompt; only the context differs.",
              f"Run on {head['date']}. Score = share of answers graded correct (categories 1–4)."]
-    if paired:
+    if paired and name == "LoCoMo":
         facts.append(f"Full context was run on a sample to save tokens: {coverage(b['full'])} (up to 10 of "
                      "each question type per conversation). It is compared with memwise on those same questions.")
 
@@ -242,8 +250,24 @@ def panel(name: str, b: dict, price: float = 1.0, refs: list[list[str]] | None =
                                                                if paired else ""), LEGEND if full else "", grouped=True)
              + table + '<ul class="facts">' + "".join(f"<li>{e(f)}</li>" for f in facts) + "</ul>")
     return (f'<section class="panel" id="p-{e(name)}"><h2>{e(name)}</h2>'
-            f'<p class="meta">{e(coverage(head))} · {len(cats)} categories</p>'
+            f'<p class="meta">{e(coverage(head))} · {len([c for c in cats if c != "abstention"])} {"question types" if name == "LongMemEval" else "categories"}</p>'
             f'<p class="desc">{e(BENCHMARKS.get(name, ""))}</p>{cards}</section>')
+
+
+def longmemeval_facts(head: dict) -> list[str]:
+    st = head["settings"]
+    return [f"Answers and grading: {st['chat_model']}, graded with the benchmark's rule for each type of question",
+            f"Embeddings: {st['embed_model']}",
+            f"Set-up: memwise's own extraction prompt, sensitive details {st['sensitive']}, past recall "
+            f"{'on' if st['past'] else 'off'}, {st['top_k']} memories"
+            + (f", the user's lines kept and {st['message_top_k']} recalled" if st.get("keep_messages") else "")
+            + (f", the assistant's replies kept and {st['assistant_top_k']} pieces recalled"
+               if st.get("assistant_top_k") else ""),
+            "Each question has its own history of about 50 chats (about 124,000 tokens); a memory is built from each.",
+            "memwise and full context answer with the same model and prompt; only the context differs.",
+            "Abstention questions ask about something never said; they are also counted in their own types.",
+            f"Run on {head['date']}" + (f", {st['per_type']} questions of each type, spread across it."
+                                        if st.get("per_type") else ".")]
 
 
 def empty_panel(name: str) -> str:

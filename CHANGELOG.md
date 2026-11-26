@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.0 (2026-11-26)
+
+memwise can keep what the assistant said, and is measured on a second benchmark, LongMemEval.
+
+- **Keep what the assistant said, too.** `MemoryConfig.keep_assistant_messages` (off by default)
+  keeps the assistant's replies word for word, in pieces of at most `assistant_piece_chars`
+  (1,200), so "which hostel did you recommend?" can be answered. No memory is taken from them:
+  they're searched on their own and returned in `Recall.assistant_messages` (up to
+  `assistant_message_top_k`, 8), and `build_context` lists them as what the assistant told the
+  user. A reply follows the user message it answers (not kept when that message isn't; its
+  scope and sensitivity). The `messages` table gets a `role` column; older files get it when
+  opened. On a 60-question LongMemEval sample (10 of each type), memwise went from 75.0 to 88.3:
+  questions about what the assistant said from 1 right to 9, with about 5,200 tokens of context
+  a question instead of 3,300. One question that can't be answered (what a bus would save) was
+  answered from an estimate the assistant had once given (so was it with the whole history). Recall is slower with many replies
+  kept: p50 1.6 s against 0.7 s (3.3 s on histories with long replies), the embedding call included
+- **LongMemEval:** `evals/longmemeval.py` runs the LongMemEval benchmark (cleaned S: 500
+  questions, each with its own history of about 50 chats), with a whole-history baseline, and
+  `evals/report.py` shows its question types. On a 60-question sample, memwise scores 88.3 with
+  about 5,200 tokens of context a question; the whole history 93.3 with about 124,000. The
+  results are in the README and on the results page, in a LongMemEval tab next to LoCoMo
+
 ## 0.5.1 (2026-11-26)
 
 A fix: a new project no longer closes the projects before it.

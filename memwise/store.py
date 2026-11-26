@@ -7,7 +7,9 @@ Design choices worth copying:
   * `memory_log` records every operation (ADD, SUPERSEDE, EXPIRE, FORGET, ...).
     It is how you debug memory ("why does it think I like coffee?").
   * `messages` holds what the user said, word for word, only with
-    `MemoryConfig.keep_messages`; each row lists the memories taken from it.
+    `MemoryConfig.keep_messages`; each row lists the memories taken from it. With
+    `MemoryConfig.keep_assistant_messages` it also holds the assistant's replies (role
+    "assistant"), which no memory is taken from.
   * The schema maps directly onto Postgres + pgvector if you outgrow SQLite.
 
 Concurrency: one `MemoryStore` can be shared by threads in a single process (for
@@ -68,6 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_log_user ON memory_log (user_id);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 -- What the user said, word for word; only written with MemoryConfig.keep_messages.
+-- role 'assistant': what the assistant replied (MemoryConfig.keep_assistant_messages).
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -77,7 +80,8 @@ CREATE TABLE IF NOT EXISTS messages (
     scope TEXT NOT NULL,
     sensitive INTEGER NOT NULL,
     memory_ids TEXT NOT NULL,
-    embedding TEXT NOT NULL
+    embedding TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user'
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages (user_id);
 """
@@ -103,6 +107,10 @@ class MemoryStore:
         if path != ":memory:":
             self.db.execute("PRAGMA journal_mode=WAL")  # readers don't block the writer
         self.db.executescript(SCHEMA)
+        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+        if "role" not in columns:  # a file from before kept assistant messages
+            self.db.execute("ALTER TABLE messages ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+            self.db.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -215,10 +223,10 @@ class MemoryStore:
     @_locked
     def insert_message(self, s: SavedMessage) -> None:
         self.db.execute(
-            "INSERT INTO messages (id, user_id, ref, at, text, scope, sensitive, memory_ids, embedding) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, user_id, ref, at, text, scope, sensitive, memory_ids, embedding, role) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (s.id, s.user_id, s.ref, s.at.isoformat(), s.text, s.scope, int(s.sensitive),
-             json.dumps(s.memory_ids), json.dumps(s.embedding)))
+             json.dumps(s.memory_ids), json.dumps(s.embedding), s.role))
         self.db.commit()
 
     @_locked
@@ -229,13 +237,13 @@ class MemoryStore:
 
     @_locked
     def messages(self, user_id: str) -> list[SavedMessage]:
-        """Every kept message for this user, oldest first."""
+        """Every kept message for this user (the assistant's too), oldest first."""
         rows = self.db.execute(
             "SELECT * FROM messages WHERE user_id = ? ORDER BY at, rowid", (user_id,)).fetchall()
         return [SavedMessage(id=r["id"], user_id=r["user_id"], ref=r["ref"], text=r["text"],
                              at=datetime.fromisoformat(r["at"]), scope=r["scope"],
                              sensitive=bool(r["sensitive"]), memory_ids=json.loads(r["memory_ids"]),
-                             embedding=json.loads(r["embedding"])) for r in rows]
+                             embedding=json.loads(r["embedding"]), role=r["role"]) for r in rows]
 
     @_locked
     def delete_messages(self, message_ids: list[str]) -> int:

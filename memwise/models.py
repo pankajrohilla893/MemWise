@@ -71,7 +71,8 @@ class Memory:
 
 @dataclass
 class SavedMessage:
-    """Something the user said, kept word for word (only with `MemoryConfig.keep_messages`).
+    """Something the user said, kept word for word (only with `MemoryConfig.keep_messages`),
+    or, with `MemoryConfig.keep_assistant_messages`, a piece of what the assistant replied.
 
     Extraction keeps what matters and drops the rest; a kept message still has the details
     ("the book I read last year was Nothing Is Impossible"). Secrets are redacted first.
@@ -86,3 +87,4 @@ class SavedMessage:
     sensitive: bool = False   # a sensitive memory was taken from it
     memory_ids: list[str] = field(default_factory=list)  # memories taken from (or confirmed by) it
     embedding: list[float] = field(default_factory=list, repr=False)
+    role: str = "user"        # "assistant" for what the assistant said: never a fact about the user

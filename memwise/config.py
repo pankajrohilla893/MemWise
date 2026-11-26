@@ -76,6 +76,15 @@ class MemoryConfig:
     # How many kept messages recall returns, besides the ones memories came from. Messages are
     # ranked by embedding similarity and by shared keywords (names, titles), combined.
     message_top_k: int = 10
+    # Also keep what the assistant replied, word for word, in pieces of at most
+    # `assistant_piece_chars` (off by default), so "which hostel did you recommend?" can be
+    # answered. No memory is taken from them: they're searched on their own, up to
+    # `assistant_message_top_k` at recall, and shown as what the assistant said. A reply
+    # follows the user's message it answers: it isn't kept when that message isn't (a
+    # sensitive detail without consent, a "forget that ..."), and has its scope and sensitivity.
+    keep_assistant_messages: bool = False
+    assistant_message_top_k: int = 8
+    assistant_piece_chars: int = 1200
 
     # ---- read path (retriever) ------------------------------------------
     weights: dict[str, float] = field(default_factory=lambda: {

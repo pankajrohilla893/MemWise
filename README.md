@@ -31,6 +31,9 @@ everything. Deleting also scrubs the audit log.
 
 ## Benchmark results
 
+memwise is measured on two benchmarks of long chat histories: LoCoMo, below, and
+[LongMemEval](#longmemeval-a-first-sample-of-60-questions), so far on a sample of 60 questions.
+
 [LoCoMo](https://github.com/snap-research/locomo) is the long-conversation benchmark that memory
 systems are usually measured on: 10 chats between two friends, each spanning months (19 to 32
 sessions), and 1,540 questions about them.
@@ -116,9 +119,66 @@ a fraction of the tokens, and that cost stays flat however long the history grow
   are graded. Adversarial questions (category 5) are left out, as in published results.
 - One run. Model output varies a little, so a repeat run can differ by about a point.
 
-The [results page](docs/benchmarks.html) has the charts, by question type. GitHub shows HTML
-files as source, so download it and open it in a browser. To run the benchmark yourself, see
-[Benchmark: LoCoMo](#benchmark-locomo).
+### LongMemEval: a first sample of 60 questions
+
+[LongMemEval](https://github.com/xiaowu0162/LongMemEval) tests an assistant's memory of its own
+chats with a user. Each of its 500 questions comes with its own history of about 50 chats, about
+124,000 tokens, and the few chats that hold the answer are hidden among the others. memwise has
+been run on 60 of them so far (the cleaned S version): 10 of each type, spread across the
+benchmark.
+
+**memwise answers 88.3% of the 60 correctly with about 5,200 tokens of context per question.
+The whole history in the prompt scores 93.3 with about 124,000: memwise uses 96% fewer tokens
+and scores 5 points lower.**
+
+| Question type | What it needs | memwise | Whole history |
+|---|---|---|---|
+| What the user said | a fact from one chat | 100 | 100 |
+| What the assistant said | something the assistant replied | 90 | 100 |
+| Preference | advice built on what the user told it | 80 | 90 |
+| Multi-session | facts from several chats together | 70 | 70 |
+| Knowledge update | the latest value of something that changed | 90 | 100 |
+| Temporal reasoning | dates, and how long between them | 100 | 100 |
+| **All** | | **88.3** | **93.3** |
+
+Four of the 60 ask about something that was never said (abstention). Both answer 3 of the 4
+correctly.
+
+- **Keep the assistant's replies for questions like these.** By default memwise remembers only
+  the user: it then answers 1 of the 10 questions about what the assistant said, and scores 75.0
+  overall. With `keep_assistant_messages` (see
+  [Keep what the assistant said, too](#keep-what-the-assistant-said-too)) it answers 9 of 10 and
+  scores 88.3, with about 1,900 more tokens of context a question.
+- **Where it's weak:** counting across chats ("How many items of clothing do I need to pick up or
+  return?"), where the whole history does no better; a long list cut into pieces, where the
+  piece holding the answer wasn't found; and one update missed (sneakers moved from under the
+  bed to a shoe rack).
+- **Here, building the memory costs more than it saves.** It takes about 48 extraction calls and
+  180,000 tokens a question, more than sending the whole history once (124,000). LongMemEval
+  asks one question of each history. In a product, the memory is built once and serves every
+  later request, while the whole history is sent with each one, and keeps growing.
+
+How it was measured:
+
+- Each question gets its own memwise, built from its chats in date order. It recalls 10
+  memories, 30 of the user's lines and 8 pieces of the assistant's replies, including memories
+  that are no longer true, as history. Sensitive details are stored without asking.
+- gpt-6-luna extracts the memories, answers and grades; text-embedding-3-small makes the
+  embeddings. Each answer is graded with LongMemEval's rule for its type: a count of days that
+  is off by one is accepted, for an update the latest value is the answer, advice is judged
+  against a description of what the user wants, and a question about something never said is
+  answered right by saying it can't be known. The whole history is answered by the same model
+  with the same prompt.
+- It's a sample: one question moves a type's score by 10 points, and a repeat run can move the
+  overall score by 1 to 2 points. The answer prompt's rule for advice ("build on what they've
+  told you") was written after looking at this sample's preference questions. On the 20
+  preference questions not in the sample, memwise scored 60 (45 without the rule) and the whole
+  history 55.
+
+The [results page](docs/benchmarks.html) has the charts by question type, with a tab for each
+benchmark. GitHub shows HTML files as source, so download it and open it in a browser. To run
+the benchmarks yourself, see [Benchmark: LoCoMo](#benchmark-locomo) and
+[Benchmark: LongMemEval](#benchmark-longmemeval).
 
 ---
 
@@ -130,7 +190,7 @@ From GitHub:
 pip install "git+https://github.com/pankajrohilla893/MemWise.git"
 ```
 
-To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.5.1"`.
+To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.6.0"`.
 There is nothing else to install. memwise and its built-in LLM client use only the Python
 standard library, so it works with whatever model provider you already use.
 
@@ -452,6 +512,26 @@ sensitivity rules of the memories taken from them. `forget()` deletes the messag
 came from and those that name it, and `forget_all()` deletes them all. A model can miss a
 sensitive detail, so turn this on where keeping chat history is acceptable.
 
+### Keep what the assistant said, too
+
+memwise remembers the user: memories are only ever taken from what the user says. When users
+come back to what the assistant told them ("which hostel did you recommend?", "what was the
+27th item on that list?"), keep the assistant's replies as well:
+
+```python
+config = MemoryConfig.for_embedding_model(keep_messages=True, keep_assistant_messages=True,
+                                          assistant_message_top_k=8)
+```
+
+Each reply is kept word for word, cut into pieces of at most `assistant_piece_chars` (1,200)
+at line breaks, so a numbered list keeps its numbers. No memory is taken from them: they're
+searched on their own, and `recall()` returns up to `assistant_message_top_k` in
+`.assistant_messages`, which `build_context` lists under "What you told the user before", with
+a reminder that they're what the assistant said, and may have been wrong. A reply follows the
+user's message it answers: it isn't kept when that message isn't, and it gets that message's
+scope and sensitivity. Secrets are redacted, and `forget()` deletes the replies that name what
+is forgotten. It works with or without `keep_messages`.
+
 ### Use your own extraction prompt
 
 The built-in prompt is written for a personal assistant. When your product cares about other
@@ -738,6 +818,39 @@ per million input tokens, and `--reference` adds a result someone else published
 ```bash
 python evals/report.py evals/data/locomo-results/*.summary.json --out benchmarks.html
 ```
+
+Pass LongMemEval summaries as well, and the page gets a tab for each benchmark.
+
+### Benchmark: LongMemEval
+
+[LongMemEval](https://github.com/xiaowu0162/LongMemEval) gives each question its own history of
+about 50 chats between a user and an assistant. [`evals/longmemeval.py`](evals/longmemeval.py)
+builds a memwise from each history, in date order, and answers the question from it. Results
+are in [Benchmark results](#longmemeval-a-first-sample-of-60-questions) above. The data isn't
+included, so download it once (277 MB, MIT licence):
+
+```bash
+mkdir -p evals/data/longmemeval
+curl -L -o evals/data/longmemeval/longmemeval_s_cleaned.json https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+python evals/longmemeval.py --per-type 10 --assistant-top-k 8 --baseline   # the 60-question sample above
+```
+
+Options:
+- `--per-type N` runs N questions of each type, spread across it; leave it out for all 500
+  (about 24,000 chats to build). `--type NAME` runs one type, `--question ID` one question.
+- `--assistant-top-k N` keeps the assistant's replies and recalls up to N pieces of them
+  (`MemoryConfig.keep_assistant_messages`).
+- `--message-top-k N` sets how many of the user's lines are recalled (default 30; 0 doesn't keep
+  them), and `--top-k N` how many memories (default 10).
+- `--no-past` leaves out memories that are no longer true; `--consent` asks before storing
+  sensitive details (memwise's default).
+- `--baseline` also answers with the whole history in the prompt, about 124,000 tokens a
+  question; `--full-workers N` limits how many of those run at once, to stay under rate limits.
+- `--resume FILE.jsonl` keeps an earlier run's answers and asks only the ones that failed.
+- `--show-wrong N` prints wrong answers with what memwise gave.
+
+Each memory is built once and kept in `evals/data/longmemeval-memory/`. Every answer is saved in
+`evals/data/longmemeval-results/`, with a `.summary.json` that `evals/report.py` reads.
 
 ## How it works
 

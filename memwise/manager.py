@@ -54,6 +54,8 @@ class Recall:
     # and other kept messages that match the query, best first. Held-back ones are left out.
     sources: dict[str, SavedMessage] = field(default_factory=dict)
     messages: list[ScoredMessage] = field(default_factory=list)
+    # With MemoryConfig.keep_assistant_messages: pieces of the assistant's replies that match.
+    assistant_messages: list[ScoredMessage] = field(default_factory=list)
     # With a rewriter: the queries searched as well as `query`.
     searched: list[str] = field(default_factory=list)
 
@@ -124,42 +126,57 @@ class MemoryManager:
             extras["now"] = self.clock.now()
         candidates = self.extractor.extract(pairs, **extras)  # may call an LLM: outside the lock
         decisions = self.add(user_id, candidates)
-        if self.config.keep_messages:
-            self._keep_messages(user_id, pairs, decisions)
+        if self.config.keep_messages or self.config.keep_assistant_messages:
+            self._keep_messages(user_id, turns, decisions)
         return decisions
 
-    def _keep_messages(self, user_id: str, pairs: list[tuple[str, str]], decisions: list[Decision]) -> None:
-        """Keep what the user said, word for word, linked to the memories taken from it."""
+    def _keep_messages(self, user_id: str, turns: list[dict[str, str]], decisions: list[Decision]) -> None:
+        """Keep what the user said, word for word, linked to the memories taken from it, and
+        (keep_assistant_messages) the assistant's replies, in pieces, with no memories."""
         by_ref: dict[str, list[Decision]] = {}
         for d in decisions:
             by_ref.setdefault(d.candidate.source_ref, []).append(d)
-        keep: list[tuple[str, str, list[Decision]]] = []
-        for ref, text in pairs:
-            ds = by_ref.get(ref, [])
-            if any(d.candidate.forget for d in ds):
-                continue  # "forget that I live in Oslo" names what is to be forgotten
-            if self.config.require_consent_for_sensitive and any(
-                    d.op == "IGNORE" and d.candidate.sensitive and not d.candidate.explicit for d in ds):
-                continue  # a sensitive detail the user didn't ask us to keep
-            if self.config.block_secrets:
-                text = reconciler.redact_secrets(text)
-            if text.strip():
-                keep.append((ref, text, ds))
+        keep: list[tuple[str, str, str, list[Decision], str, bool]] = []  # ref, role, text, ds, scope, sensitive
+        answers: tuple[str, bool] | None = ("general", False)  # what a reply follows: the last user message
+        for t in turns:
+            if t["role"] == "user":
+                ds = by_ref.get(t["ref"], [])
+                answers = self._message_fate(ds)
+                if answers is None or not self.config.keep_messages:
+                    continue
+                text = reconciler.redact_secrets(t["content"]) if self.config.block_secrets else t["content"]
+                if text.strip():
+                    keep.append((t["ref"], "user", text, ds, *answers))
+            elif self.config.keep_assistant_messages and answers is not None:
+                text = reconciler.redact_secrets(t["content"]) if self.config.block_secrets else t["content"]
+                pieces = _pieces(text, self.config.assistant_piece_chars)
+                for k, piece in enumerate(pieces, 1):
+                    keep.append((t["ref"] + (f"#{k}" if len(pieces) > 1 else ""), "assistant", piece, [], *answers))
         if not keep:
             return
         embed_many = getattr(self.embedder, "embed_many", None)  # outside the lock: may be a network call
-        texts = [text for _, text, _ in keep]
+        texts = [x[2] for x in keep]
         vectors = embed_many(texts) if embed_many else [self.embedder.embed(t) for t in texts]
         with self._lock:
             now = self.clock.now()
-            for (ref, text, ds), vector in zip(keep, vectors):
+            for (ref, role, text, ds, scope, sensitive), vector in zip(keep, vectors):
                 ids = list(dict.fromkeys(d.result.id for d in ds if d.result is not None))
                 if any(self.store.get(i) is None for i in ids):
                     continue  # forgotten in the meantime
-                scope = next((d.candidate.scope for d in ds if d.candidate.scope != "general"), "general")
                 self.store.insert_message(SavedMessage(
                     id=self.store.next_id("s"), user_id=user_id, ref=ref, text=text, at=now, scope=scope,
-                    sensitive=any(d.candidate.sensitive for d in ds), memory_ids=ids, embedding=vector))
+                    sensitive=sensitive, memory_ids=ids, embedding=vector, role=role))
+
+    def _message_fate(self, ds: list[Decision]) -> tuple[str, bool] | None:
+        """The scope and sensitivity a user message is kept with, from the memories taken from
+        it, or None when it isn't kept at all (nor the replies to it)."""
+        if any(d.candidate.forget for d in ds):
+            return None  # "forget that I live in Oslo" names what is to be forgotten
+        if self.config.require_consent_for_sensitive and any(
+                d.op == "IGNORE" and d.candidate.sensitive and not d.candidate.explicit for d in ds):
+            return None  # a sensitive detail the user didn't ask us to keep
+        scope = next((d.candidate.scope for d in ds if d.candidate.scope != "general"), "general")
+        return scope, any(d.candidate.sensitive for d in ds)
 
     def _known(self, user_id: str, pairs: list[tuple[str, str]]) -> list[Memory]:
         """Stored memories to show the extractor: most relevant first, never sensitive ones."""
@@ -241,7 +258,7 @@ class MemoryManager:
             result = Recall(query, scope, prof,
                             [surfacer.decide(s, scope, now, self.config) for s in hits], past,
                             searched=searched)
-            if self.config.keep_messages:
+            if self.config.keep_messages or self.config.keep_assistant_messages:
                 self._recall_messages(result, user_id, q, list(zip(searched, also)))
 
             # Using a memory does NOT confirm it is still true; only the user
@@ -263,8 +280,11 @@ class MemoryManager:
 
     def _recall_messages(self, result: Recall, user_id: str, q: list[float],
                          also: list[tuple[str, list[float]]]) -> None:
-        """Fill in the message each shown memory came from, and other kept messages that match."""
-        saved = self.store.messages(user_id)
+        """Fill in the message each shown memory came from, other kept messages that match,
+        and pieces of the assistant's replies that match (searched on their own)."""
+        everything = self.store.messages(user_id)
+        saved = [s for s in everything if s.role != "assistant"]
+        replies = [s for s in everything if s.role == "assistant"]
         first: dict[str, SavedMessage] = {}
         for s in saved:  # oldest first: a memory's source is the message it was first taken from
             for i in s.memory_ids:
@@ -283,6 +303,12 @@ class MemoryManager:
             asked = cosine(q, x.message.embedding)  # sensitive ones must match the request itself
             if not surfacer.hold_message(x.message, asked, result.scope, self.config):
                 result.messages.append(x)
+        for x in retriever.messages(self.store, user_id, result.query, q, self.config,
+                                    saved=replies, limit=len(replies), also=also):
+            if len(result.assistant_messages) == self.config.assistant_message_top_k:
+                break
+            if not surfacer.hold_message(x.message, cosine(q, x.message.embedding), result.scope, self.config):
+                result.assistant_messages.append(x)
 
     def build_context(self, recall: Recall, include_guidelines: bool = True, *,
                       about: str = "the user") -> str:
@@ -345,6 +371,11 @@ class MemoryManager:
             for x in sorted(recall.messages, key=lambda x: x.message.at):
                 lines.append(f"- {_day(x.message.at)}: \"{with_dates(x.message.text, x.message.at)}\"")
 
+        if recall.assistant_messages:
+            heading(f"## What you told {about} before (your own replies, word for word; may be relevant)")
+            for x in sorted(recall.assistant_messages, key=lambda x: x.message.at):
+                lines.append(f"- {_day(x.message.at)}: \"{with_dates(x.message.text, x.message.at)}\"")
+
         if lines and include_guidelines:
             lines += [
                 "",
@@ -355,7 +386,10 @@ class MemoryManager:
             ]
             if past:
                 lines.append("- Memories that are no longer true are history: never treat them as true now.")
-            if recall.messages or recall.sources:
+            if recall.assistant_messages:
+                lines.append("- Your own past replies say what you told them then, not what they said; "
+                             "they may have been wrong.")
+            if recall.messages or recall.sources or recall.assistant_messages:
                 lines.append("- What was said is dated. Words like \"last week\" are followed by the dates they "
                              "meant on that day, in [brackets].")
         return "\n".join(lines)
@@ -457,8 +491,34 @@ def _turns(messages: Iterable[Message]) -> list[dict[str, str]]:
         turn = {"role": role, "content": content}
         if role == "user":
             turn["ref"] = str(ref) if ref else str(i)
+        else:
+            turn["ref"] = str(ref) if ref else f"a{i}"
         turns.append(turn)
     return turns
+
+
+def _pieces(text: str, limit: int) -> list[str]:
+    """A reply cut into pieces of at most `limit` characters, at line breaks where it can be
+    (so a numbered list keeps its numbers), else between words."""
+    out: list[str] = []
+    piece = ""
+    for line in text.splitlines():
+        line = line.rstrip()
+        while len(line) > limit:  # one long line: cut it between words
+            cut = line.rfind(" ", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            if piece:
+                out.append(piece)
+                piece = ""
+            out.append(line[:cut].rstrip())
+            line = line[cut:].lstrip()
+        if piece and len(piece) + 1 + len(line) > limit:
+            out.append(piece)
+            piece = ""
+        piece = f"{piece}\n{line}" if piece else line
+    if piece:
+        out.append(piece)
+    return [p.strip() for p in out if p.strip()]
 
 
 def _day(when) -> str:

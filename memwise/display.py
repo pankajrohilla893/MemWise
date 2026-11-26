@@ -83,6 +83,9 @@ def recall(r: Recall) -> None:
     for x in r.messages:
         print(f"  {op('SAID')} {x.message.id:<4} {fit(repr(x.message.text), 46):<46} "
               + c(f"rel {x.relevance:.2f}  keywords {x.keywords:.1f}", "dim"))
+    for x in r.assistant_messages:
+        print(f"  {op('TOLD')} {x.message.id:<4} {fit(repr(x.message.text), 46):<46} "
+              + c(f"rel {x.relevance:.2f}  keywords {x.keywords:.1f}  (the assistant's reply)", "dim"))
 
 
 def memory_table(memories: list[Memory], now: datetime, show_history: bool = False) -> None:
