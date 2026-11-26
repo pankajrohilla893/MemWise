@@ -60,6 +60,8 @@ def decisions(ds: list[Decision]) -> None:
         flag_text = c(f" [{', '.join(flags)}]", "dim") if flags else ""
         print(f"  {op(d.op)} {mem_id:<4} {d.candidate.text}{flag_text}")
         print(c(f"  {'':9} {'':4} why: {d.reason}", "dim"))
+        for m in d.also:
+            print(c(f"  {'':9} {'':4} also closes {m.id}: {m.text}", "dim"))
 
 
 def recall(r: Recall) -> None:

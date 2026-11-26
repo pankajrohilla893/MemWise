@@ -39,7 +39,7 @@ From GitHub:
 pip install "git+https://github.com/pankajrohilla893/MemWise.git"
 ```
 
-To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.3.0"`.
+To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.4.0"`.
 There is nothing else to install. memwise and its built-in LLM client use only the Python
 standard library, so it works with whatever model provider you already use.
 
@@ -238,8 +238,9 @@ open the same SQLite file.
 
 | Call | When to use it |
 |---|---|
-| `MemoryManager(store, extractor=..., embedder=..., config=...)` | Once, at startup |
+| `MemoryManager(store, extractor=..., embedder=..., config=..., judge=...)` | Once, at startup. `judge` is optional |
 | `LLMExtractor(llm, system_prompt=..., scopes=...)` | Lets any model extract memories. `llm` is a function `(system, messages) -> str`. `system_prompt` and `scopes` are optional: your own extraction instructions and scope names (see [Use your own extraction prompt](#use-your-own-extraction-prompt)) |
+| `LLMJudge(llm)` | Optional. Lets a model say when a new memory replaces stored ones the rules can't link ("Went vegetarian" vs "Loves steak"); see [Let a model judge what the rules can't see](#let-a-model-judge-what-the-rules-cant-see) |
 | `OpenAICompatible(base_url=..., model=..., api_key=...)` | A ready-made `llm` for any `/chat/completions` API |
 | `OpenAICompatibleEmbedder(base_url=..., model=..., api_key=...)` | A ready-made embedder for any `/embeddings` API |
 | `MemoryConfig.for_embedding_model()` | Thresholds to start from with a real embedding model |
@@ -259,7 +260,8 @@ A `Recall` has `.profile` (always-loaded memories), `.items` (one decision per r
 with `.action`, `.reason` and `.scored.memory`), and `.used` (everything except HOLD).
 
 Every decision returned by `ingest()` and `add()` has `.op` (ADD, CONFIRM, SUPERSEDE, RETRACT,
-FORGET or IGNORE), `.reason`, and `.result` (the memory written).
+FORGET or IGNORE), `.reason`, `.target` (the stored memory it acts on), `.result` (the memory
+written) and `.also` (more memories it closed, when a judge said a change makes several untrue).
 
 ---
 
@@ -353,6 +355,41 @@ config.single_valued |= {"apron_size", "glove_size", "delivery_slot"}   # a new 
 - For a completely different job, write the whole prompt yourself.
   [`examples/git_commits.py`](examples/git_commits.py) does this to remember a repository instead
   of a person.
+
+### Let a model judge what the rules can't see
+
+The rules compare a new memory with stored ones that share its predicate: one city at a time,
+"dislikes X" cancels "likes X". They can't link different predicates, so "Went vegetarian" is
+added next to "Loves steak", and "Runs 10k every morning" only confirms "Runs 5k every morning".
+An optional judge asks a model about those cases:
+
+```python
+from memwise import LLMExtractor, LLMJudge, MemoryManager
+
+memory = MemoryManager(store, extractor=LLMExtractor(llm), embedder=embedder, config=config,
+                       judge=LLMJudge(llm))
+```
+
+The model answers ADD, UPDATE (the new memory replaces the ones it names), NONE (already known)
+or DELETE (for "no longer true"). memwise keeps the decision:
+
+- **It's only asked where the rules can't tell:** when they would add a memory, confirm one that
+  is worded differently, replace one, or find nothing to retract, and similar memories are
+  stored. Forget requests, secrets, sensitive details and allergies never reach it. When a rule
+  replaces a memory (a new city, a new diet), that stands: the judge may only close other
+  memories the change makes out of date ("Is vegan" also closes "Likes cheese").
+- **Its answer is checked.** It may only name memories it was shown that are still current. It
+  never sees sensitive or safety memories, so it can't close them. Anything else falls back to
+  the rules.
+- **Nothing is deleted.** A replaced memory is closed and kept as history, like every other
+  SUPERSEDE. One change can close several memories ("Went vegan" closes "Loves steak" and
+  "Likes cheese"), listed in the decision's `.also`.
+- **One extra model call per conversation, at most,** made outside the manager's lock. If it
+  fails, a warning is logged and the rules decide.
+
+Change what it's shown with `config.judge_related` (how many similar memories, default 5) and
+`config.judge_min_similarity`, or pass your own instructions with
+`LLMJudge(llm, system_prompt=...)`. Any object with a `judge(requests)` method works too.
 
 ### Write your own extractor
 
@@ -449,7 +486,8 @@ bring Redis back until a properly sized cluster is available.
 Routine commits ("fix typo", "bump version") leave no memory, a commit telling "AI assistants"
 what to remember is ignored, and each run reads only new commits. The memory is kept inside
 `.git`, so it is never committed. It stores conclusions, not history: to find which commit
-changed a file, use `git log`.
+changed a file, use `git log`. Add `--judge` to let a model catch replacements filed under
+different names, such as "Uses Django-Q instead of Celery" next to "Processes photos with Celery".
 
 ## Test it with your model
 
@@ -474,6 +512,16 @@ shapes the next order, an address change, fraud in a pasted email, "delete my da
 
 ```bash
 python evals/support_bot.py --repeat 3
+```
+
+[`evals/judge.py`](evals/judge.py) checks the optional judge: changes the rules can't see ("Went
+vegetarian", "now 10k runs", "moved to the platform team"), and things it must keep (tea *and*
+coffee, a general preference next to a specific favourite, a preference after one bad
+experience). Run the other evals with `--judge` to check it changes nothing else.
+
+```bash
+python evals/judge.py --repeat 3       # --no-judge runs the same scenarios with the rules alone
+python evals/scenarios.py --judge
 ```
 
 ## How it works
@@ -506,7 +554,7 @@ read paths, maintenance, deletion, and how memory differs from RAG.
 
 ## Status and limitations
 
-This is an early release (0.3). Things to know before relying on it:
+This is an early release (0.4). Things to know before relying on it:
 
 - **`RuleExtractor`** only understands a fixed list of English phrasings. Use it for tests and
   demos, and an LLM extractor in production.
@@ -521,7 +569,8 @@ This is an early release (0.3). Things to know before relying on it:
 ## Roadmap
 
 - Postgres + pgvector store
-- An LLM judge for contradictions between free-text memories
+- An LLM judge for contradictions between free-text memories (done in 0.4.0 as `LLMJudge`; see
+  [Let a model judge what the rules can't see](#let-a-model-judge-what-the-rules-cant-see))
 - Condensing old episodes into facts during maintenance
 - An async API
 

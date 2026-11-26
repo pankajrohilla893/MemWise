@@ -28,8 +28,8 @@ This page explains the design. For installation and usage, see the [README](../R
 |---|---|
 | [`models.py`](../memwise/models.py) | `Candidate` (a proposal) and `Memory` (a stored claim) |
 | [`extractor.py`](../memwise/extractor.py) | The `Extractor` interface and the offline `RuleExtractor` |
-| [`llm.py`](../memwise/llm.py) | `LLMExtractor` (any model), the `OpenAICompatible` and `OpenAICompatibleEmbedder` clients, the extraction prompt and parser |
-| [`reconciler.py`](../memwise/reconciler.py) | The write gate and the ADD / CONFIRM / SUPERSEDE / RETRACT / FORGET / IGNORE decision |
+| [`llm.py`](../memwise/llm.py) | `LLMExtractor` and `LLMJudge` (any model), the `OpenAICompatible` and `OpenAICompatibleEmbedder` clients, the prompts and parsers |
+| [`reconciler.py`](../memwise/reconciler.py) | The write gate, the ADD / CONFIRM / SUPERSEDE / RETRACT / FORGET / IGNORE decision, and the checks on an optional judge |
 | [`store.py`](../memwise/store.py) | SQLite storage, audit log, locking |
 | [`embed.py`](../memwise/embed.py) | The `Embedder` interface, the built-in `HashingEmbedder`, cosine similarity |
 | [`retriever.py`](../memwise/retriever.py) | The always-loaded profile and ranked retrieval |
@@ -100,6 +100,7 @@ JSON it returns. Both return the same type, so everything after this step is ide
 | The write gate rejects it | **IGNORE**, with a reason |
 | A single-valued predicate (one city at a time) with the same value | **CONFIRM**: refresh `last_confirmed` |
 | A single-valued predicate with a different value | **SUPERSEDE**: close the old memory, add the new one |
+| A near-duplicate of an existing memory, with different numbers ("Boot size is EU 42" → "EU 43"; not for episodes) | **SUPERSEDE**: embeddings score these as near-identical, but the number is the news |
 | A near-duplicate of an existing memory | **CONFIRM** |
 | Contradicts its opposite ("dislikes X" vs "likes X") | **SUPERSEDE** |
 | Anything else | **ADD** |
@@ -107,6 +108,31 @@ JSON it returns. Both return the same type, so everything after this step is ide
 `apply()` carries out the decision. A replaced memory is **closed** (`valid_to`, `superseded_by`)
 instead of being overwritten, so you can always answer "where did they used to live?" and
 explain why a memory changed. Every operation is written to the audit log.
+
+### 4. Optional: a judge for what the rules can't see
+
+The rules only compare memories that share a predicate, so "Went vegetarian" (`diet`) is added
+next to "Loves steak" (`likes`), and "Runs 10k every morning" only confirms "Runs 5k every
+morning" because the value, running, is the same. `MemoryManager(judge=LLMJudge(llm))` asks a
+model about exactly those cases, the way some memory systems let a model decide every update.
+Here the model still only proposes:
+
+| Step | What happens |
+|---|---|
+| Who is asked about | Candidates the rules would ADD, CONFIRM in different words, SUPERSEDE, or find nothing to retract for, when similar memories are stored (`judge_min_similarity`, up to `judge_related`) |
+| Who never is | Forget requests, secrets and anything else the write gate refuses, sensitive candidates, safety predicates |
+| What it sees | The candidate and its most similar current memories, with ids. Never sensitive or safety memories |
+| What it answers | ADD, UPDATE (ids it replaces), NONE (the id it repeats), or DELETE (ids that stopped, for "no longer true") |
+| What memwise does | UPDATE → SUPERSEDE every named memory · NONE → CONFIRM · DELETE → RETRACT · ADD → the rules' answer |
+| What is checked | Each id must be one it was shown, for this user, and still current. A rule's SUPERSEDE (one city, one diet) stands, and UPDATE can only close more memories next to it. For a re-worded CONFIRM, UPDATE must name the memory the rules matched. Anything else falls back to the rules |
+
+The call is made before the manager takes its lock, once for the whole conversation, and the
+checks run again under the lock, so a memory deleted meanwhile is left alone. If the call fails
+or the reply can't be read, a warning is logged and the rules decide.
+
+**Why it's careful about NONE.** A wrong UPDATE is recoverable: the old memory is kept as
+history. A wrong NONE drops the new memory. That's why allergies, which a wrong NONE could lose,
+never go to the judge, and why its prompt says to choose ADD when unsure.
 
 ## Read path
 
@@ -208,7 +234,8 @@ next to it.
 ## Design principles
 
 1. **The LLM proposes, your code decides.** Extraction can use any model, but storing,
-   replacing and forgetting follow tested rules.
+   replacing and forgetting follow tested rules. The optional judge proposes too: its answers
+   are checked before they're used.
 2. **Close rows, never overwrite them.** History explains every change.
 3. **Write time is when to resolve contradictions**, not search time.
 4. **Leave memories out rather than telling the model to stay quiet.**

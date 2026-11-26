@@ -7,6 +7,7 @@
     python evals/scenarios.py                    # every scenario once
     python evals/scenarios.py --repeat 3         # three runs each, to spot flaky behaviour
     python evals/scenarios.py --only sensitive   # scenarios whose name contains "sensitive"
+    python evals/scenarios.py --judge            # with the optional LLMJudge (see evals/judge.py)
 
 Unit tests (tests/) check the library's rules with a fake model. These check the whole
 system with YOUR model: does it extract the right things, ignore what it should, and do
@@ -31,8 +32,8 @@ from typing import Callable
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from memwise import (Clock, LLMError, LLMExtractor, MemoryConfig, MemoryManager, MemoryStore,
-                     OpenAICompatible, OpenAICompatibleEmbedder)
+from memwise import (Clock, LLMError, LLMExtractor, LLMJudge, MemoryConfig, MemoryManager,
+                     MemoryStore, OpenAICompatible, OpenAICompatibleEmbedder)
 
 U = "user"
 
@@ -50,13 +51,15 @@ class UserMessagesOnly:
 class Run:
     """One scenario run: a fresh memory, a clock, and the checks it records."""
 
-    def __init__(self, llm: OpenAICompatible, embedder, config: MemoryConfig, context: bool = True):
+    def __init__(self, llm: OpenAICompatible, embedder, config: MemoryConfig, context: bool = True,
+                 judge: bool = False):
         self.llm = llm
         self.clock = Clock(fixed_start=datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc))
         extractor = LLMExtractor(llm)
         self.mm = MemoryManager(MemoryStore(":memory:"),
                                 extractor=extractor if context else UserMessagesOnly(extractor),
-                                clock=self.clock, embedder=embedder, config=config)
+                                clock=self.clock, embedder=embedder, config=config,
+                                judge=LLMJudge(llm) if judge else None)
         self.checks: list[tuple[str, bool, str]] = []
         self.sessions = 0
         self.last_judgement = ""  # the judge's reasoning, shown when a check fails
@@ -123,8 +126,13 @@ class Run:
     def check(self, name: str, ok: bool, detail: str = "") -> None:
         self.checks.append((name, bool(ok), detail))
 
-    def memory_dump(self, user: str = U) -> str:
-        return "; ".join(f"{m.predicate}={m.value!r}[{m.scope}]" for m in self.mm.current(user)) or "(none)"
+    def memory_dump(self, user: str = U, closed: bool = False) -> str:
+        """Current memories, and with `closed=True` the replaced or retracted ones too."""
+        out = "; ".join(f"{m.predicate}={m.value!r}[{m.scope}]" for m in self.mm.current(user)) or "(none)"
+        gone = [m for m in self.mm.history(user) if m.valid_to is not None]
+        if closed and gone:
+            out += " | closed: " + "; ".join(f"{m.predicate}={m.value!r}" for m in gone)
+        return out
 
 
 def bot(text: str) -> dict:
@@ -273,7 +281,8 @@ def memory_shapes_the_answer(t: Run):
     t.check("recipe is vegan",
             t.judge(answer, "Is every ingredient the reply names plant-based? Meat, fish, eggs, dairy "
                             "(milk, butter, cheese, yogurt, ghee) and honey are not; plant-based milks "
-                            "are. Judge only the ingredients it names, and don't guess about others."),
+                            "are, and so are cooking oil, salt, herbs and spices unless named as "
+                            "animal fats. Judge only the ingredients it names, and don't guess about others."),
             f"{answer[:250]} | judge: {t.last_judgement}")
     t.check("recipe has no peanuts",
             t.judge(answer, "Is the reply free of peanuts, meaning it doesn't list peanuts or peanut "
@@ -443,8 +452,9 @@ SCENARIOS: list[Callable[[Run], None]] = [
 
 # =========================================================================== runner
 
-def run_one(scenario, llm, embedder, config, context=True) -> tuple[str, list[tuple[str, bool, str]], float, str]:
-    t = Run(llm, embedder, config, context)
+def run_one(scenario, llm, embedder, config, context=True,
+            judge=False) -> tuple[str, list[tuple[str, bool, str]], float, str]:
+    t = Run(llm, embedder, config, context, judge)
     start = time.time()
     error = ""
     try:
@@ -454,8 +464,10 @@ def run_one(scenario, llm, embedder, config, context=True) -> tuple[str, list[tu
     return scenario.__name__, t.checks, time.time() - start, error
 
 
-def main(scenarios: list[Callable[[Run], None]] | None = None, description: str | None = None) -> None:
-    """Run `scenarios` (default: the general ones above). Product evals reuse this runner."""
+def main(scenarios: list[Callable[[Run], None]] | None = None, description: str | None = None,
+         judge: bool = False) -> None:
+    """Run `scenarios` (default: the general ones above). Product evals reuse this runner.
+    `judge` is whether the LLMJudge is on unless `--judge` / `--no-judge` says otherwise."""
     parser = argparse.ArgumentParser(description=description or __doc__,
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--repeat", type=int, default=1, help="runs per scenario (default 1)")
@@ -463,6 +475,8 @@ def main(scenarios: list[Callable[[Run], None]] | None = None, description: str 
     parser.add_argument("--workers", type=int, default=6, help="scenarios run in parallel (default 6)")
     parser.add_argument("--no-context", action="store_true",
                         help="extract from the user's messages alone, to compare")
+    parser.add_argument("--judge", action=argparse.BooleanOptionalAction, default=judge,
+                        help=f"use the optional LLMJudge (default: {'on' if judge else 'off'})")
     args = parser.parse_args()
 
     try:
@@ -473,11 +487,13 @@ def main(scenarios: list[Callable[[Run], None]] | None = None, description: str 
     config = MemoryConfig.for_embedding_model() if embedder else MemoryConfig()
     chosen = [s for s in (scenarios or SCENARIOS) if args.only in s.__name__]
     print(f"chat model: {llm.model}   embeddings: {embedder.model if embedder else 'built-in'}   "
-          f"scenarios: {len(chosen)} x {args.repeat}" + ("   (no context)" if args.no_context else "") + "\n")
+          f"scenarios: {len(chosen)} x {args.repeat}   judge: {'on' if args.judge else 'off'}"
+          + ("   (no context)" if args.no_context else "") + "\n")
 
     jobs = [s for s in chosen for _ in range(args.repeat)]
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        results = list(pool.map(lambda s: run_one(s, llm, embedder, config, not args.no_context), jobs))
+        results = list(pool.map(lambda s: run_one(s, llm, embedder, config, not args.no_context,
+                                                  args.judge), jobs))
 
     by_name: dict[str, list] = {}
     for name, checks, secs, error in results:

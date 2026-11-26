@@ -19,8 +19,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from memwise import Candidate, Clock, MemoryConfig, MemoryManager, MemoryStore  # noqa: E402
-from memwise.llm import (LLMError, LLMExtractor, OpenAICompatible,  # noqa: E402
-                         OpenAICompatibleEmbedder, parse_memories)
+from memwise.llm import (JUDGE_SYSTEM, LLMError, LLMExtractor, LLMJudge,  # noqa: E402
+                         OpenAICompatible, OpenAICompatibleEmbedder, parse_memories,
+                         parse_verdicts)
 
 U = "u1"
 _STORES: list[MemoryStore] = []
@@ -75,6 +76,23 @@ class WritePath(unittest.TestCase):
         self.assertEqual(d.op, "CONFIRM")
         self.assertEqual(len(mm.history(U)), 1)
         self.assertEqual(d.result.last_confirmed, mm.clock.now())
+
+    def test_a_changed_number_replaces_instead_of_confirming(self):
+        mm = manager()
+        [old] = [d.result for d in mm.add(U, Candidate("fact", "note", "boot size", "Hiking boot size is EU 42"))]
+        [d] = mm.add(U, Candidate("fact", "note", "boot size", "Hiking boot size is EU 43"))
+        self.assertEqual((d.op, d.target.id), ("SUPERSEDE", old.id))
+        self.assertIn("42 -> 43", d.reason)
+        self.assertEqual([m.text for m in mm.current(U)], ["Hiking boot size is EU 43"])
+
+    def test_numbers_alone_dont_replace_episodes_or_restatements(self):
+        mm = manager()
+        mm.add(U, Candidate("episode", "experience", "late delivery", "Order 5531 arrived late"))
+        [d] = mm.add(U, Candidate("episode", "experience", "late delivery", "Order 6120 arrived late"))
+        self.assertEqual(d.op, "ADD")                     # two separate events
+        mm.add(U, pref("likes", "running", "Runs 5k every morning"))
+        [d] = mm.add(U, pref("likes", "running", "Runs every morning"))
+        self.assertEqual(d.op, "CONFIRM")                 # no numbers on one side: a restatement
 
     def test_negation_retracts(self):
         mm = manager()
@@ -571,6 +589,45 @@ class OpenAICompatibleClient(FakeServer, unittest.TestCase):
         self.assertEqual(caught.exception.status, 401)
         self.assertIn("invalid api key", str(caught.exception))
 
+    def test_dropped_connections_are_retried_and_reported_as_llm_errors(self):
+        import memwise.llm as llm_module
+
+        class Reply:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, *args):
+                return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+
+        calls = []
+
+        def flaky(request, timeout):
+            calls.append(1)
+            if len(calls) < 3:
+                raise ConnectionResetError(54, "Connection reset by peer")
+            return Reply()
+
+        real_open, real_sleep = llm_module.urllib.request.urlopen, llm_module.time.sleep
+        llm_module.urllib.request.urlopen, llm_module.time.sleep = flaky, lambda s: None
+        try:
+            self.assertEqual(OpenAICompatible(base_url="http://x/v1", model="m")("s", []), "ok")
+            self.assertEqual(len(calls), 3)                 # two drops, then success
+            calls.clear()
+            with self.assertRaises(LLMError):               # never a raw ConnectionResetError
+                OpenAICompatible(base_url="http://x/v1", model="m", retries=1)("s", [])
+            self.assertEqual(len(calls), 2)
+        finally:
+            llm_module.urllib.request.urlopen, llm_module.time.sleep = real_open, real_sleep
+
+    def test_client_errors_are_not_retried(self):
+        url, got = self.serve(401, {"error": {"message": "invalid api key"}})
+        with self.assertRaises(LLMError):
+            OpenAICompatible(base_url=url, model="m", api_key="bad")("s", [])
+        self.assertEqual(len(got["bodies"]), 1)
+
     def test_from_env_explains_what_to_set(self):
         with self.assertRaises(LLMError) as caught:
             OpenAICompatible.from_env(prefix="MEMWISE_TEST_UNSET_")
@@ -664,6 +721,273 @@ class EmbeddingModels(FakeServer, unittest.TestCase):
         self.assertEqual(c.top_k, 3)
 
 
+class FakeJudgeLLM:
+    """Stands in for the model behind `LLMJudge`. `answer` gives the decisions for a prompt."""
+
+    def __init__(self, answer=None, raw: str | None = None, error: Exception | None = None):
+        self.answer, self.raw, self.error = answer, raw, error
+        self.prompts: list[str] = []
+        self.during = None   # called while the model is "thinking"
+
+    def __call__(self, system, messages):
+        prompt = messages[-1]["content"]
+        self.prompts.append(prompt)
+        if self.during:
+            self.during()
+        if self.error:
+            raise self.error
+        if self.raw is not None:
+            return self.raw
+        return json.dumps({"decisions": self.answer(prompt) if self.answer else []})
+
+
+def judged(llm: FakeJudgeLLM, **config) -> MemoryManager:
+    config.setdefault("judge_min_similarity", -1.0)   # show every stored memory to the judge
+    clock = Clock(fixed_start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    return MemoryManager(store(), clock=clock, config=MemoryConfig(**config), judge=LLMJudge(llm))
+
+
+def pref(predicate: str, value: str, text: str, kind: str = "preference", **kw) -> Candidate:
+    return Candidate(kind, predicate, value, text, **kw)
+
+
+class Judging(unittest.TestCase):
+    """The optional judge: asked only where the rules can't tell, and checked before it's used."""
+
+    def test_without_a_judge_the_rules_keep_both(self):
+        mm = manager()
+        mm.add(U, pref("likes", "steak", "Loves steak"))
+        [d] = mm.add(U, pref("diet", "vegetarian", "Went vegetarian", kind="fact"))
+        self.assertEqual(d.op, "ADD")
+        self.assertEqual(len(mm.current(U)), 2)
+
+    def test_update_supersedes_and_keeps_history(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        [steak] = [d.result for d in mm.add(U, pref("likes", "steak", "Loves steak"))]
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE", "ids": [steak.id], "reason": "no meat now"}]
+        [d] = mm.add(U, pref("diet", "vegetarian", "Went vegetarian", kind="fact"))
+        self.assertEqual((d.op, d.reason), ("SUPERSEDE", "model: no meat now"))
+        self.assertEqual([m.text for m in mm.current(U)], ["Went vegetarian"])
+        old = mm.store.get(steak.id)
+        self.assertIsNotNone(old.valid_to)                 # closed, not deleted
+        self.assertEqual(old.superseded_by, d.result.id)
+        self.assertIn("Loves steak", llm.prompts[0])
+
+    def test_update_can_close_several_memories(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        ids = [d.result.id for d in mm.add(U, [pref("likes", "steak", "Loves steak"),
+                                                pref("likes", "cheese", "Likes cheese"),
+                                                pref("likes", "tea", "Likes tea")])]
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE", "ids": ids[:2]}]
+        [d] = mm.add(U, pref("diet", "vegan", "Went vegan", kind="fact"))
+        self.assertEqual(d.op, "SUPERSEDE")
+        self.assertEqual(sorted(m.text for m in mm.current(U)), ["Likes tea", "Went vegan"])
+        self.assertEqual(sum(1 for row in mm.store.logs(U) if row["op"] == "SUPERSEDE"), 2)
+
+    def test_none_confirms_instead_of_adding(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        [hiking] = [d.result for d in mm.add(U, pref("likes", "hiking", "Loves hiking"))]
+        mm.clock.advance(30)
+        llm.answer = lambda p: [{"item": 1, "op": "NONE", "ids": [hiking.id]}]
+        [d] = mm.add(U, pref("likes", "hill walking", "Enjoys walks in the hills"))
+        self.assertEqual((d.op, d.target.id), ("CONFIRM", hiking.id))
+        self.assertEqual(len(mm.history(U)), 1)
+        self.assertEqual(mm.store.get(hiking.id).last_confirmed, mm.clock.now())
+
+    def test_add_keeps_both(self):
+        llm = FakeJudgeLLM(lambda p: [{"item": 1, "op": "ADD"}])
+        mm = judged(llm)
+        mm.add(U, pref("likes", "tea", "Likes tea"))
+        [d] = mm.add(U, pref("likes", "coffee", "Likes coffee in the afternoon"))
+        self.assertEqual(d.op, "ADD")
+        self.assertEqual(len(mm.current(U)), 2)
+
+    def test_delete_retracts_what_stopped_in_other_words(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        [running] = [d.result for d in mm.add(U, pref("likes", "running", "Goes running every morning"))]
+        llm.answer = lambda p: [{"item": 1, "op": "DELETE", "ids": [running.id]}]
+        [d] = mm.add(U, pref("likes", "jogging", "No longer jogs", negated=True))
+        self.assertEqual(d.op, "RETRACT")
+        self.assertEqual(mm.current(U), [])
+        self.assertIn("(no longer true)", llm.prompts[0])
+
+    def test_new_wording_of_the_same_value_can_replace_it(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        [old] = [d.result for d in mm.add(U, pref("likes", "running", "Runs 5k every morning"))]
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE", "ids": [old.id]}]
+        [d] = mm.add(U, pref("likes", "running", "Runs 10k every morning"))
+        self.assertEqual(d.op, "SUPERSEDE")
+        self.assertEqual([m.text for m in mm.current(U)], ["Runs 10k every morning"])
+
+    def test_new_wording_must_replace_the_memory_the_rules_matched(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        run, tea = [d.result for d in mm.add(U, [pref("likes", "running", "Goes running most mornings"),
+                                                 pref("likes", "tea", "Likes tea")])]
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE", "ids": [tea.id]}]
+        [d] = mm.add(U, pref("likes", "running", "Running is how every day starts"))
+        self.assertEqual((d.op, d.target.id), ("CONFIRM", run.id))   # the rules' answer stands
+        self.assertTrue(mm.store.get(tea.id).is_current(mm.clock.now()))
+
+    def test_ids_it_was_not_shown_are_ignored(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm, judge_related=1)
+        mm.add("someone-else", pref("likes", "steak", "Loves steak"))
+        a, b = [d.result for d in mm.add(U, [pref("likes", "steak", "Loves steak"),
+                                             pref("likes", "tea", "Likes tea")])]
+        theirs = mm.current("someone-else")[0]
+        # Only one memory is shown (judge_related=1); name everything except that one.
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE",
+                                 "ids": [m for m in (a.id, b.id) if f"  {m}:" not in p] + [theirs.id, "m999"]}]
+        [d] = mm.add(U, pref("diet", "vegetarian", "Went vegetarian", kind="fact"))
+        self.assertEqual(sum(f"  {m}:" in llm.prompts[-1] for m in (a.id, b.id)), 1)
+        self.assertEqual(d.op, "ADD")
+        self.assertEqual(len(mm.current(U)), 3)
+        self.assertEqual(len(mm.current("someone-else")), 1)
+
+    def test_never_sees_or_closes_sensitive_and_safety_memories(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        allergy, health = [d.result for d in mm.add(U, [
+            Candidate("fact", "allergy", "shellfish", "Allergic to shellfish", explicit=True),
+            Candidate("fact", "health", "diabetes", "Has type 1 diabetes", sensitive=True, explicit=True)])]
+        mm.add(U, pref("likes", "beaches", "Loves beach holidays"))
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE", "ids": [allergy.id, health.id]}]
+        [d] = mm.add(U, pref("likes", "seafood", "Loves seafood platters"))
+        self.assertEqual(d.op, "ADD")
+        self.assertNotIn("Allergic to shellfish", llm.prompts[0])
+        self.assertNotIn("diabetes", llm.prompts[0])
+        now = mm.clock.now()
+        self.assertTrue(mm.store.get(allergy.id).is_current(now))
+        self.assertTrue(mm.store.get(health.id).is_current(now))
+
+    def test_secrets_sensitive_safety_and_forget_never_reach_the_judge(self):
+        llm = FakeJudgeLLM(lambda p: [{"item": 1, "op": "NONE", "ids": ["m1"]}])
+        mm = judged(llm)
+        mm.add(U, pref("likes", "peanut butter", "Loves peanut butter"))
+        llm.prompts.clear()
+        ds = mm.add(U, [
+            Candidate("fact", "note", "card", "Card is 4111 1111 1111 1111", explicit=True),
+            Candidate("fact", "health", "asthma", "Has asthma", sensitive=True, explicit=True),
+            Candidate("fact", "allergy", "peanuts", "Allergic to peanuts", explicit=True),
+            pref("likes", "peanut butter", "Loves peanut butter", forget=True)])
+        self.assertEqual(llm.prompts, [])
+        self.assertEqual([d.op for d in ds], ["IGNORE", "ADD", "ADD", "FORGET"])
+
+    def test_a_single_valued_change_stands_whatever_the_judge_says(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        berlin, cafe = [d.result for d in mm.add(U, [
+            Candidate("fact", "lives_in", "Berlin", "Lives in Berlin"),
+            pref("likes", "Cafe Lotte", "Favourite cafe is Cafe Lotte in Berlin")])]
+        llm.answer = lambda p: [{"item": 1, "op": "NONE", "ids": [cafe.id]}]
+        [d] = mm.add(U, Candidate("fact", "lives_in", "Lisbon", "Lives in Lisbon"))
+        self.assertEqual((d.op, d.target.id, d.also), ("SUPERSEDE", berlin.id, []))
+        self.assertTrue(mm.store.get(cafe.id).is_current(mm.clock.now()))
+
+    def test_the_judge_can_keep_both_when_only_numbers_differ(self):
+        llm = FakeJudgeLLM(lambda p: [{"item": 1, "op": "ADD", "reason": "two different children"}])
+        mm = judged(llm)
+        mm.add(U, Candidate("fact", "note", "child", "Has a 7-year-old child"))
+        [d] = mm.add(U, Candidate("fact", "note", "child", "Has a 9-year-old child"))
+        self.assertEqual((d.op, d.reason), ("ADD", "model: two different children"))
+        self.assertEqual(len(mm.current(U)), 2)
+
+    def test_the_judge_can_close_more_alongside_a_single_valued_change(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        veggie, cheese, tea = [d.result for d in mm.add(U, [
+            Candidate("fact", "diet", "vegetarian", "Is vegetarian"),
+            pref("likes", "cheese", "Likes cheese"), pref("likes", "tea", "Likes tea")])]
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE", "ids": [veggie.id, cheese.id]}]
+        [d] = mm.add(U, Candidate("fact", "diet", "vegan", "Is vegan"))
+        self.assertEqual((d.op, d.target.id, [m.id for m in d.also]), ("SUPERSEDE", veggie.id, [cheese.id]))
+        self.assertIn("one diet at a time", d.reason)
+        self.assertEqual(sorted(m.text for m in mm.current(U)), ["Is vegan", "Likes tea"])
+        self.assertEqual(mm.store.get(cheese.id).superseded_by, d.result.id)
+
+    def test_not_asked_when_nothing_similar_is_stored(self):
+        llm = FakeJudgeLLM(lambda p: [{"item": 1, "op": "ADD"}])
+        clock = Clock(fixed_start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        mm = MemoryManager(store(), clock=clock, judge=LLMJudge(llm))   # default threshold
+        mm.add(U, pref("likes", "tea", "Likes tea"))                   # nothing stored yet
+        mm.add(U, pref("likes", "jazz", "Listens to jazz records"))    # nothing similar
+        self.assertEqual(llm.prompts, [])
+
+    def test_one_call_for_everything_in_one_ingest(self):
+        llm = FakeJudgeLLM(lambda p: [{"item": n, "op": "ADD"} for n in (1, 2, 3)])
+        mm = judged(llm)
+        mm.add(U, pref("likes", "tea", "Likes tea"))
+        mm.add(U, [pref("likes", "coffee", "Likes coffee"), pref("likes", "jazz", "Likes jazz"),
+                   pref("likes", "chess", "Plays chess")])
+        self.assertEqual(len(llm.prompts), 1)   # the first add had nothing to compare with
+        self.assertIn("Item 3 (new): Plays chess", llm.prompts[0])
+
+    def test_failures_fall_back_to_the_rules(self):
+        for llm in (FakeJudgeLLM(error=LLMError("timed out")), FakeJudgeLLM(raw="Sure! Let me think.")):
+            mm = judged(llm)
+            mm.add(U, pref("likes", "steak", "Loves steak"))
+            with self.assertLogs("memwise", "WARNING"):
+                [d] = mm.add(U, pref("diet", "vegetarian", "Went vegetarian", kind="fact"))
+            self.assertEqual(d.op, "ADD")
+
+    def test_the_model_is_asked_outside_the_lock(self):
+        llm = FakeJudgeLLM(lambda p: [{"item": 1, "op": "ADD"}])
+        mm = judged(llm)
+        mm.add(U, pref("likes", "tea", "Likes tea"))
+        got = []
+
+        def another_thread_takes_the_lock():
+            t = threading.Thread(target=lambda: got.append(mm._lock.acquire(timeout=2) and mm._lock.release() is None))
+            t.start()
+            t.join()
+
+        llm.during = another_thread_takes_the_lock
+        mm.add(U, pref("likes", "coffee", "Likes coffee"))
+        self.assertEqual(got, [True])
+
+    def test_a_memory_that_changed_while_judging_is_left_alone(self):
+        llm = FakeJudgeLLM()
+        mm = judged(llm)
+        [steak] = [d.result for d in mm.add(U, pref("likes", "steak", "Loves steak"))]
+        llm.answer = lambda p: [{"item": 1, "op": "UPDATE", "ids": [steak.id]}]
+        llm.during = lambda: mm.forget(U, steak.id)   # the user deletes it meanwhile
+        [d] = mm.add(U, pref("diet", "vegetarian", "Went vegetarian", kind="fact"))
+        self.assertEqual(d.op, "ADD")
+        self.assertEqual([m.text for m in mm.history(U)], ["Went vegetarian"])
+
+    def test_ingest_uses_the_judge_after_extraction(self):
+        def llm(system, messages):
+            if system == JUDGE_SYSTEM:
+                steak = next(m for m in mm.current(U) if m.value == "steak")
+                return json.dumps({"decisions": [{"item": 1, "op": "UPDATE", "ids": [steak.id]}]})
+            return json.dumps({"memories": [{"kind": "fact", "predicate": "diet", "value": "vegetarian",
+                                             "text": "Is vegetarian", "source_ref": "t0"}]})
+
+        clock = Clock(fixed_start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        mm = MemoryManager(store(), extractor=LLMExtractor(llm), clock=clock, judge=LLMJudge(llm),
+                           config=MemoryConfig(judge_min_similarity=-1.0))
+        mm.add(U, pref("likes", "steak", "Loves steak"))
+        [d] = mm.ingest(U, [("t0", "I went vegetarian last month.")])
+        self.assertEqual(d.op, "SUPERSEDE")
+        self.assertEqual([m.value for m in mm.current(U)], ["vegetarian"])
+
+    def test_verdicts_are_read_forgivingly(self):
+        reply = 'Here you go:\n```json\n{"decisions": [{"item": 2, "op": "update", "id": "m3"},' \
+                ' {"item": 1, "op": "none", "ids": ["m1"]}, {"item": 9, "op": "ADD"},' \
+                ' {"item": 3, "op": "MERGE", "ids": ["m2"]}]}\n```'
+        v = parse_verdicts(reply, 3)
+        self.assertEqual([(x.op, x.ids) if x else None for x in v],
+                         [("NONE", ["m1"]), ("UPDATE", ["m3"]), None])
+        with self.assertRaises(ValueError):
+            parse_verdicts("I can't decide.", 1)
+
+
 class LibraryAPI(unittest.TestCase):
     """The extension points other products rely on."""
 
@@ -733,7 +1057,7 @@ class Concurrency(unittest.TestCase):
                 try:
                     for i in range(10):
                         for d in mm.ingest(f"user{n}", [f"I love hobby{n}x{i}."]):
-                            if d.op == "ADD":
+                            if d.op in ("ADD", "SUPERSEDE"):   # both write a new memory
                                 added.append(d.result.id)
                         mm.recall(f"user{n}", "what are my hobbies?")
                 except Exception as e:  # pragma: no cover - surfaced below

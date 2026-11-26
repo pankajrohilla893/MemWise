@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Union
@@ -20,9 +21,11 @@ from .config import MemoryConfig
 from .embed import Embedder, HashingEmbedder, cosine
 from .extractor import Extractor, RuleExtractor
 from .models import Candidate, Memory
-from .reconciler import Decision
+from .reconciler import Decision, Judge, Verdict
 from .store import MemoryStore
 from .surfacer import SurfaceDecision
+
+_log = logging.getLogger("memwise")
 
 # A message is plain text or a (source_ref, text) pair, both meaning something the user said,
 # or a chat turn {"role": "user" | "assistant", "content": "...", "ref": "..."} (ref optional),
@@ -59,16 +62,21 @@ class MemoryManager:
         embedder:  turns text into vectors. Defaults to the built-in `HashingEmbedder`.
         config:    every threshold and rule; see `MemoryConfig`.
         clock:     where "now" comes from. Override it in tests.
+        judge:     optional. Asked where the rules can't tell whether a new memory replaces
+                   or repeats a stored one ("Went vegetarian" vs "Loves steak"). `LLMJudge`
+                   asks any model; see `reconciler` for when it is asked and how its answer
+                   is checked. Off by default: then the rules decide everything.
     """
 
     def __init__(self, store: MemoryStore | None = None, extractor: Extractor | None = None,
                  clock: Clock | None = None, *, embedder: Embedder | None = None,
-                 config: MemoryConfig | None = None):
+                 config: MemoryConfig | None = None, judge: Judge | None = None):
         self.store = store or MemoryStore()
         self.extractor = extractor or RuleExtractor()
         self.clock = clock or Clock()
         self.embedder = embedder or HashingEmbedder()
         self.config = config or MemoryConfig()
+        self.judge = judge
         # Reconciling reads then writes; the lock keeps two threads from
         # superseding the same memory at once.
         self._lock = threading.RLock()
@@ -110,17 +118,42 @@ class MemoryManager:
         """Reconcile candidates you built yourself (a settings form, an import, your own extractor).
 
         They go through the same write gate and ADD/CONFIRM/SUPERSEDE/RETRACT
-        rules as extracted ones.
+        rules as extracted ones, and the judge, if there is one.
         """
         if isinstance(candidates, Candidate):
             candidates = [candidates]
+        candidates = list(candidates)
+        verdicts = self._judge(user_id, candidates)  # may call a model: outside the lock
         with self._lock:
             now = self.clock.now()
             decisions = []
-            for c in candidates:
-                d = reconciler.decide(c, self.store, user_id, now, self.config, self.embedder)
+            for i, c in enumerate(candidates):
+                verdict, shown = verdicts.get(i, (None, frozenset()))
+                d = reconciler.decide(c, self.store, user_id, now, self.config, self.embedder,
+                                      verdict=verdict, shown=shown)
                 decisions.append(reconciler.apply(d, self.store, user_id, now, self.embedder))
             return decisions
+
+    def _judge(self, user_id: str, candidates: list[Candidate]) -> dict[int, tuple[Verdict, frozenset[str]]]:
+        """Ask the judge about the candidates the rules can't settle, in one call.
+
+        This runs before the lock is taken, so a slow model doesn't block other threads. The
+        verdicts are checked again under the lock: a memory that changed in the meantime is
+        left alone, and the rules decide instead.
+        """
+        if self.judge is None or not candidates:
+            return {}
+        requests = reconciler.judge_requests(candidates, self.store, user_id, self.clock.now(),
+                                             self.config, self.embedder)
+        if not requests:
+            return {}
+        verdicts = self.judge.judge([r for _, r in requests])
+        if len(verdicts) != len(requests):
+            _log.warning("memwise: the judge returned %d verdicts for %d requests; the rules decided",
+                         len(verdicts), len(requests))
+            return {}
+        return {i: (v, frozenset(m.id for m in r.related))
+                for (i, r), v in zip(requests, verdicts) if v is not None}
 
     # ---- read path -------------------------------------------------------
     def recall(self, user_id: str, query: str, scope: str = "general",

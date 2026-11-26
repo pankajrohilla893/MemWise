@@ -54,6 +54,12 @@ class MemoryConfig:
     lasting_predicates: set[str] = field(default_factory=lambda: {
         "name", "lives_in", "address", "employer", "job_title", "response_style", "diet", "allergy",
         "health"})
+    # The optional judge (`MemoryManager(judge=...)`): when the rules would add a memory, confirm
+    # one in new words, or find nothing to retract, the judge is shown up to `judge_related` of
+    # the most similar stored memories (never sensitive or safety ones), if any score at least
+    # `judge_min_similarity`, and decides whether the new memory replaces or repeats them.
+    judge_related: int = 5
+    judge_min_similarity: float = 0.2
 
     # ---- read path (retriever) ------------------------------------------
     weights: dict[str, float] = field(default_factory=lambda: {
@@ -95,7 +101,8 @@ class MemoryConfig:
         tree nuts" score about 0.81, and treating them as one memory would lose an allergy.
         """
         values: dict[str, Any] = dict(min_relevance=0.08, relevant_enough=0.16,
-                                      sensitive_relevant_enough=0.18, duplicate_similarity=0.90)
+                                      sensitive_relevant_enough=0.18, duplicate_similarity=0.90,
+                                      judge_min_similarity=0.2)
         values.update(overrides)
         return cls(**values)
 

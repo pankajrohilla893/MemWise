@@ -8,6 +8,7 @@
     python examples/git_commits.py path/to/repo                  # read new commits, show the memory
     python examples/git_commits.py path/to/repo --ask "How should I cache sessions?"
     python examples/git_commits.py path/to/repo --rebuild        # forget it all and start over
+    python examples/git_commits.py path/to/repo --judge          # let a model catch what rules miss
 
 memwise is built for memories about a person, but the same machinery fits a repository.
 "Migrate tests from Jest to Vitest" replaces the old test framework and keeps it as history,
@@ -33,8 +34,9 @@ from datetime import datetime
 # Lets you run this from a clone without installing.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from memwise import (Clock, LLMError, LLMExtractor, MemoryConfig, MemoryManager, MemoryStore,
+from memwise import (Clock, LLMError, LLMExtractor, LLMJudge, MemoryConfig, MemoryManager, MemoryStore,
                      OpenAICompatible, OpenAICompatibleEmbedder)
+from memwise.llm import JUDGE_SYSTEM
 
 COMMIT_PROMPT = """You extract lasting knowledge about a software project from its git commits.
 
@@ -45,7 +47,8 @@ Keep only what a developer joining the project should know, and what should chan
 about it: technology choices, conventions and rules, constraints the project holds itself to
 ("no runtime dependencies", "must work offline"), architecture decisions, supported versions,
 and lessons from incidents and reverts. A first commit or a release often states several of
-these at once: give each one. Skip routine work: typo and formatting
+these at once: give each one ("Initial commit: Django app in Python 3.11" -> language: Python,
+framework: Django, runtime_version: Python 3.11). Skip routine work: typo and formatting
 fixes, version bumps, merges, dependency updates, small bug fixes, refactors and WIP commits,
 unless the message explains a decision or a lesson. Most commits give nothing.
 
@@ -60,7 +63,8 @@ For each memory:
 - predicate: use one of these when it fits, so later changes replace the old value:
   language, framework, database, cache, queue, test_framework, package_manager, formatter,
   linter, ci, hosting, runtime_version, auth, api_style. Where the project runs or is
-  deployed is always hosting ("Deploy to Fly.io" -> hosting: Fly.io).
+  deployed is always hosting ("Deploy to Fly.io" -> hosting: Fly.io). What runs background
+  jobs is always queue ("Process uploads with Celery and RabbitMQ" -> queue: Celery).
   Otherwise use: convention (for instructions), decision, experience (for episodes), note.
 - value: the bare value ("PostgreSQL", "Vitest", "pnpm", "Node 20"). Details go in text.
 - text: a short statement with no pronouns ("Uses PostgreSQL as the main database",
@@ -124,7 +128,12 @@ def read_commits(repo: str, since: str | None) -> list[tuple[str, datetime, str]
     return commits
 
 
-def build_manager(db: str) -> tuple[MemoryManager, LLMExtractor, CommitClock, OpenAICompatible]:
+# The judge's instructions, about a project instead of a person.
+PROJECT_JUDGE = (JUDGE_SYSTEM.replace("a user's", "a software project's")
+                 .replace("about the user", "about the project").replace("the user said", "a commit said"))
+
+
+def build_manager(db: str, judge: bool = False) -> tuple[MemoryManager, LLMExtractor, CommitClock, OpenAICompatible]:
     try:
         llm = OpenAICompatible.from_env()
         embedder = OpenAICompatibleEmbedder.from_env() if os.environ.get("MEMWISE_EMBED_MODEL") else None
@@ -138,7 +147,10 @@ def build_manager(db: str) -> tuple[MemoryManager, LLMExtractor, CommitClock, Op
     config.prune_episodes_after_days = 3650
     clock = CommitClock()
     extractor = LLMExtractor(llm, system_prompt=COMMIT_PROMPT)
-    mm = MemoryManager(MemoryStore(db), extractor=extractor, clock=clock, embedder=embedder, config=config)
+    # Optional: a model catches replacements the rules can't see, such as "Uses Django-Q instead
+    # of Celery" filed under a different predicate than "Processes photos with Celery".
+    mm = MemoryManager(MemoryStore(db), extractor=extractor, clock=clock, embedder=embedder, config=config,
+                       judge=LLMJudge(llm, system_prompt=PROJECT_JUDGE) if judge else None)
     return mm, extractor, clock, llm
 
 
@@ -148,6 +160,8 @@ def main() -> None:
     parser.add_argument("--ask", action="append", default=[], help="a question to answer with the memory")
     parser.add_argument("--batch", type=int, default=10, help="commits per model call (default 10; bigger batches miss more removals)")
     parser.add_argument("--rebuild", action="store_true", help="delete the memory and read every commit again")
+    parser.add_argument("--judge", action="store_true",
+                        help="ask a model about replacements the rules can't see (an extra call per commit that needs it)")
     args = parser.parse_args()
 
     repo = os.path.abspath(args.repo)
@@ -166,7 +180,7 @@ def main() -> None:
                 os.remove(path)
 
     project = os.path.basename(repo)
-    mm, extractor, clock, llm = build_manager(db)
+    mm, extractor, clock, llm = build_manager(db, args.judge)
 
     since = open(marker).read().strip() if os.path.exists(marker) else None
     try:

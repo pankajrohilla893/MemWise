@@ -11,18 +11,39 @@ stored and gets exactly one operation:
     FORGET     the user asked us to forget it; delete it and its history, as forget() does
     IGNORE     not worth keeping (the write gate), with a reason
 
-Here the decision is rule-based, using the predicate: some predicates can only
-have one value at a time (you live in one city; see `MemoryConfig.single_valued`),
-others can have many (you can like tea *and* hiking). For free-text memories that
-don't fit a predicate, a production system can add an LLM judge: "does B
-contradict, refine, or repeat A?".
+The decision is rule-based, using the predicate: some predicates can only have
+one value at a time (you live in one city; see `MemoryConfig.single_valued`),
+others can have many (you can like tea *and* hiking).
+
+Rules can't see links between different predicates: "Went vegetarian" doesn't
+match "Loves steak". For those, `MemoryManager(judge=...)` adds an optional judge
+(`LLMJudge` asks any model). It is only asked where the rules can't tell, and its
+answer is checked before it is used:
+
+    asked when    the rules would ADD, CONFIRM a memory in new words, SUPERSEDE, or
+                  find nothing to retract, AND similar memories are stored
+    never asked   for forget requests, anything the write gate refuses (secrets...),
+                  sensitive details or safety memories (allergies)
+    a rule's SUPERSEDE stands (one city at a time): the judge may only add other
+                  memories the change makes out of date ("Went vegan" closes "Likes cheese").
+                  The exception is a near-duplicate with new numbers ("EU 42" -> "EU 43"),
+                  which the rules replace but the judge may keep as two (ADD)
+    never shown   sensitive or safety memories, so it can't close them
+    it answers    ADD (keep the rule's answer), UPDATE (SUPERSEDE the memories it
+                  names), NONE (CONFIRM one), DELETE (RETRACT, for "no longer true")
+    checked       it may only name memories it was shown that are still current;
+                  anything else falls back to the rules
+
+A judge never deletes: replaced memories are closed and kept as history, like
+every other SUPERSEDE and RETRACT.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Iterable, Protocol
 
 from .config import DEFAULT_CONFIG, MemoryConfig
 from .embed import Embedder, HashingEmbedder, cosine
@@ -39,6 +60,9 @@ class Decision:
     target: Memory | None = None   # the existing memory this acts on
     result: Memory | None = None   # the memory written (filled in by apply())
     reason: str = ""
+    # More memories this SUPERSEDE or RETRACT closes, when a judge said the new memory makes
+    # several untrue ("Went vegan" closes "Loves steak" and "Likes cheese").
+    also: list[Memory] = field(default_factory=list)
 
 
 def _target(d: Decision) -> Memory:
@@ -49,6 +73,20 @@ def _target(d: Decision) -> Memory:
 
 def _same(a: str, b: str) -> bool:
     return a.strip().lower() == b.strip().lower()
+
+
+_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+_NEW_NUMBERS = "the same thing with new numbers"
+
+
+def _changed_numbers(old: Memory, c: Candidate) -> str:
+    """"42 -> 43" when both mention numbers and they differ, else "". One side without numbers
+    ("Runs every morning" for "Runs 5k every morning") is a restatement, not a change."""
+    before = sorted(set(_NUMBER.findall(f"{old.value} {old.text}")))
+    after = sorted(set(_NUMBER.findall(f"{c.value} {c.text}")))
+    if before and after and before != after:
+        return f"{', '.join(before)} -> {', '.join(after)}"
+    return ""
 
 
 # ---- secrets: never stored, whatever the model proposes and even if the user asks -----------
@@ -110,9 +148,162 @@ def write_gate(c: Candidate, config: MemoryConfig = DEFAULT_CONFIG) -> str | Non
     return None
 
 
+# ---- the optional judge -------------------------------------------------------------------
+
+JUDGE_OPS = ("ADD", "UPDATE", "NONE", "DELETE")
+
+
+@dataclass
+class Verdict:
+    """A judge's answer for one candidate. It is checked before anything is done with it."""
+
+    op: str                                        # ADD | UPDATE | NONE | DELETE
+    ids: list[str] = field(default_factory=list)   # the stored memories it acts on, closest first
+    reason: str = ""
+
+
+@dataclass
+class JudgeRequest:
+    """One candidate the rules can't settle, with the stored memories the judge may act on."""
+
+    candidate: Candidate
+    related: list[Memory]
+
+
+class Judge(Protocol):
+    """Anything with this method can be a judge; `LLMJudge` asks a model.
+
+    It gets every request from one `add()`/`ingest()` at once, so it can answer them in one
+    call, and returns one Verdict (or None: let the rules decide) per request, in order.
+    """
+
+    def judge(self, requests: list[JudgeRequest]) -> list[Verdict | None]: ...
+
+
+def showable(m: Memory, config: MemoryConfig = DEFAULT_CONFIG) -> bool:
+    """Whether a judge may see (and so act on) this memory. Never sensitive or safety memories:
+    they aren't sent to a model they don't need to reach, and a judge can't close them."""
+    return not m.sensitive and m.predicate not in config.safety_predicates
+
+
+def needs_judge(c: Candidate, rule: Decision, config: MemoryConfig = DEFAULT_CONFIG) -> bool:
+    """Whether the rules' answer for this candidate is one a judge may improve on.
+
+    Never for forget requests, sensitive details or safety memories: a judge that wrongly
+    answered "already known" for an allergy would lose it.
+    """
+    if c.forget or c.sensitive or c.predicate in config.safety_predicates:
+        return False
+    if c.negated:
+        return rule.op == "IGNORE"   # for "no longer true", only "nothing stored to retract"
+    if rule.op in ("ADD", "SUPERSEDE"):
+        return True
+    # Same value in new words ("Runs 10k every morning" for "Runs 5k every morning").
+    return (rule.op == "CONFIRM" and rule.target is not None and showable(rule.target, config)
+            and not _same(rule.target.text, c.text))
+
+
+def judge_requests(candidates: Iterable[Candidate], store: MemoryStore, user_id: str, now: datetime,
+                   config: MemoryConfig = DEFAULT_CONFIG,
+                   embedder: Embedder = _DEFAULT_EMBEDDER) -> list[tuple[int, JudgeRequest]]:
+    """The candidates a judge should see (by position), each with its most similar memories.
+
+    Read-only, so it can run before taking the manager's lock (a model call is slow). The
+    memories may change before the verdicts are applied; `decide` checks them again then.
+    """
+    out = []
+    pool: list[Memory] | None = None
+    for i, c in enumerate(candidates):
+        rule = decide(c, store, user_id, now, config, embedder)
+        if not needs_judge(c, rule, config):
+            continue
+        if pool is None:
+            pool = [m for m in store.current(user_id, now) if showable(m, config)]
+        vec = embedder.embed(c.text)
+        scored = sorted(((cosine(vec, m.embedding), m) for m in pool if m.subject == c.subject),
+                        key=lambda pair: pair[0], reverse=True)
+        related = [m for s, m in scored if s >= config.judge_min_similarity][: config.judge_related]
+        # The memory the rules matched is shown first, so the judge can confirm or update it.
+        if rule.target is not None and showable(rule.target, config):
+            related = [rule.target] + [m for m in related if m.id != rule.target.id]
+            related = related[: max(1, config.judge_related)]
+        if related:
+            out.append((i, JudgeRequest(c, related)))
+    return out
+
+
+def _judged(verdict: Verdict, shown: Iterable[str], c: Candidate, store: MemoryStore,
+            user_id: str, now: datetime, config: MemoryConfig) -> list[Memory]:
+    """The memories a verdict names that it may act on: shown to the judge, and still current."""
+    allowed = set(shown)
+    out: list[Memory] = []
+    for memory_id in verdict.ids:
+        m = store.get(memory_id) if memory_id in allowed else None
+        if (m is not None and m.user_id == user_id and m.subject == c.subject and m.is_current(now)
+                and showable(m, config) and all(o.id != m.id for o in out)):
+            out.append(m)
+    return out
+
+
+def _model_says(verdict: Verdict, fallback: str) -> str:
+    return f"model: {verdict.reason or fallback}"
+
+
+def _with_verdict(rule: Decision, verdict: Verdict, shown: Iterable[str], store: MemoryStore,
+                  user_id: str, now: datetime, config: MemoryConfig) -> Decision:
+    c = rule.candidate
+    targets = _judged(verdict, shown, c, store, user_id, now, config)
+    replaces = verdict.op in ("UPDATE", "DELETE")
+
+    if c.negated:   # the rules found nothing to retract
+        if replaces and targets:
+            return Decision("RETRACT", c, target=targets[0], also=targets[1:],
+                            reason=_model_says(verdict, "no longer true"))
+        return rule
+
+    if rule.op == "SUPERSEDE":   # the rules' replacement stands; the judge may close more
+        # Except a replacement guessed from numbers alone: "Has a 7-year-old" and "Has a 9-year-old"
+        # may be two children, and only the judge can tell.
+        if verdict.op == "ADD" and rule.reason.startswith(_NEW_NUMBERS):
+            return Decision("ADD", c, reason=_model_says(verdict, "both are true"))
+        if replaces and targets:
+            more = [t for t in targets if t.id != _target(rule).id]
+            if more:
+                return Decision("SUPERSEDE", c, target=rule.target, also=more,
+                                reason=f"{rule.reason}; {_model_says(verdict, 'also out of date')}")
+        return rule
+
+    if rule.op == "CONFIRM":   # same value in new words: confirm it, or let the new wording replace it
+        matched = _target(rule)
+        if replaces and any(t.id == matched.id for t in targets):
+            return Decision("SUPERSEDE", c, target=matched,
+                            also=[t for t in targets if t.id != matched.id],
+                            reason=_model_says(verdict, "replaces it"))
+        return rule
+
+    # The rules would ADD.
+    if replaces and targets:
+        return Decision("SUPERSEDE", c, target=targets[0], also=targets[1:],
+                        reason=_model_says(verdict, "replaces it"))
+    if verdict.op == "NONE" and targets:
+        return Decision("CONFIRM", c, target=targets[0], reason=_model_says(verdict, "already known"))
+    return rule
+
+
 def decide(c: Candidate, store: MemoryStore, user_id: str, now: datetime,
            config: MemoryConfig = DEFAULT_CONFIG,
-           embedder: Embedder = _DEFAULT_EMBEDDER) -> Decision:
+           embedder: Embedder = _DEFAULT_EMBEDDER, *,
+           verdict: Verdict | None = None, shown: Iterable[str] = ()) -> Decision:
+    """Pick one operation for a candidate. `verdict` is a judge's answer, and `shown` the ids
+    of the memories it was shown; it is only used where the rules allow (see the module doc)."""
+    rule = _by_rules(c, store, user_id, now, config, embedder)
+    if verdict is not None and needs_judge(c, rule, config):
+        return _with_verdict(rule, verdict, shown, store, user_id, now, config)
+    return rule
+
+
+def _by_rules(c: Candidate, store: MemoryStore, user_id: str, now: datetime,
+              config: MemoryConfig, embedder: Embedder) -> Decision:
     # 0. "Forget that ..." -> delete it. This includes sensitive memories: deleting what the
     #    user asks us to delete is always allowed. Prefer the same predicate, then any value match.
     if c.forget:
@@ -156,12 +347,18 @@ def decide(c: Candidate, store: MemoryStore, user_id: str, now: datetime,
         return Decision("SUPERSEDE", c, target=old,
                         reason=f"replaces '{old.value}' (one {c.predicate} at a time)")
 
-    # 4. Many values allowed: only a near-duplicate counts as "already known".
+    # 4. Many values allowed: only a near-duplicate counts as "already known". Embeddings blur
+    #    numbers ("Boot size is EU 42" and "... EU 43" score above 0.9), so a near-duplicate with
+    #    different numbers is the same thing changing: replace it. Episodes are separate events.
     new_vec = embedder.embed(c.text) if existing else []
     for old in existing:
         if (_same(old.value, c.value)
                 or cosine(old.embedding, new_vec) >= config.duplicate_similarity):
-            return Decision("CONFIRM", c, target=old, reason="already known")
+            changed = _changed_numbers(old, c)
+            if not changed:
+                return Decision("CONFIRM", c, target=old, reason="already known")
+            if c.kind != "episode" and old.kind != "episode":
+                return Decision("SUPERSEDE", c, target=old, reason=f"{_NEW_NUMBERS} ({changed})")
 
     # 5. "Dislikes X" cancels "likes X".
     opposite = config.opposites.get(c.predicate)
@@ -205,10 +402,10 @@ def apply(d: Decision, store: MemoryStore, user_id: str, now: datetime,
         return d
 
     if d.op == "RETRACT":
-        old = _target(d)
-        old.valid_to = now
-        store.save(old)
-        store.log(user_id, now, "RETRACT", old.id, f"{old.text!r} no longer true")
+        for old in [_target(d), *d.also]:
+            old.valid_to = now
+            store.save(old)
+            store.log(user_id, now, "RETRACT", old.id, f"{old.text!r} no longer true")
         return d
 
     # ADD and SUPERSEDE both write a new memory.
@@ -236,11 +433,11 @@ def apply(d: Decision, store: MemoryStore, user_id: str, now: datetime,
     d.result = new
 
     if d.op == "SUPERSEDE":
-        old = _target(d)
-        old.valid_to = now          # closed, not deleted: history stays queryable
-        old.superseded_by = new.id
-        store.save(old)
-        store.log(user_id, now, "SUPERSEDE", new.id, f"{old.id} {old.text!r} -> {new.text!r}")
+        for old in [_target(d), *d.also]:
+            old.valid_to = now          # closed, not deleted: history stays queryable
+            old.superseded_by = new.id
+            store.save(old)
+            store.log(user_id, now, "SUPERSEDE", new.id, f"{old.id} {old.text!r} -> {new.text!r}")
     else:
         store.log(user_id, now, "ADD", new.id, new.text)
     return d
