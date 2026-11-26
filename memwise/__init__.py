@@ -35,10 +35,12 @@ from .clock import Clock
 from .config import MemoryConfig
 from .embed import Embedder, HashingEmbedder
 from .extractor import Extractor, RuleExtractor
-from .llm import LLM, LLMError, LLMExtractor, LLMJudge, OpenAICompatible, OpenAICompatibleEmbedder
+from .llm import (LLM, LLMError, LLMExtractor, LLMJudge, LLMQueryRewriter, OpenAICompatible,
+                  OpenAICompatibleEmbedder)
 from .manager import MemoryManager, Recall
-from .models import Candidate, Memory
+from .models import Candidate, Memory, SavedMessage
 from .reconciler import Decision, Judge, JudgeRequest, Verdict
+from .retriever import Rewriter, ScoredMessage
 from .store import MemoryStore
 from .surfacer import SurfaceDecision
 
@@ -57,6 +59,7 @@ __all__ = [
     "LLMError",
     "LLMExtractor",
     "LLMJudge",
+    "LLMQueryRewriter",
     "Memory",
     "MemoryConfig",
     "MemoryManager",
@@ -64,7 +67,10 @@ __all__ = [
     "OpenAICompatible",
     "OpenAICompatibleEmbedder",
     "Recall",
+    "Rewriter",
     "RuleExtractor",
+    "SavedMessage",
+    "ScoredMessage",
     "SurfaceDecision",
     "Verdict",
     "__version__",

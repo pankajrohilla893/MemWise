@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+- **The extractor knows when the conversation happened.** `MemoryManager` passes its clock's
+  time to extractors that take `now`, and `LLMExtractor` shows it as `<today>`. The built-in
+  prompt writes dates into events, trips and plans: "yesterday" becomes "on 24 May 2023",
+  "last Sunday" becomes "on 21 May 2023". Before, "Ran a charity race last Sunday" lost its date,
+  so months later nobody could say when it happened. Lasting facts, routines and preferences get
+  no date
+- **Recall can include the past.** `recall(..., include_past=True)` also finds replaced,
+  retracted and expired memories for questions about the past ("where did I live before?").
+  They go in `Recall.past`, and `build_context` lists them apart, under "No longer true", with
+  when each was true and what replaced it. They follow the same scope and sensitivity rules.
+  It's off by default, so nothing changes unless you ask. `MemoryConfig.past_top_k` (default 3)
+- **Kept messages: what the user said, word for word.** `MemoryConfig(keep_messages=True)` keeps
+  each of the user's messages next to the memories. `recall()` returns the message each shown
+  memory came from (`Recall.sources`) and other kept messages that match (`Recall.messages`, up
+  to `message_top_k`), found by meaning, by keywords and by the date a question names ("on 13
+  October 2023", "in May 2023"), and `build_context` shows both, dated.
+  Extraction drops details nobody knew would matter ("the book I read last year"); this keeps
+  them. Secrets are redacted first. Messages follow the consent, scope and sensitivity rules of
+  the memories taken from them, and `forget()` deletes the messages a memory came from and those
+  that name it. Off by default. New: `SavedMessage`, `ScoredMessage`
+- **Relative dates are worked out in code.** New `memwise.dates`: "last weekend" said on Monday
+  17 July 2023 becomes "last weekend [the weekend before Mon 17 Jul 2023: Sat 15 Jul - Sun 16
+  Jul]". Models often counted these a week off. `LLMExtractor` sees the conversation dated this
+  way, and `build_context` shows kept messages dated from the day each was said. Only English
+  phrases with one clear meaning are dated ("yesterday", "last Friday", "two weeks ago", "next
+  month"); vague ones ("recently", "on Sunday") are left alone
+- **An optional rewriter for requests that don't sound like their answer.**
+  `MemoryManager(rewriter=LLMQueryRewriter(llm))` asks a model for up to three search queries
+  per request ("Would she enjoy a weekend outdoors?" -> "I love hiking"), and recall searches
+  with those as well (`Recall.searched`). Sensitive memories still have to match the request
+  itself. One cached call per new request, outside the lock; if it fails, recall searches with
+  the request alone. Off by default. New: `LLMQueryRewriter`, `Rewriter`, `parse_queries`,
+  `Scored.asked`
+- `evals/locomo.py` runs the [LoCoMo](https://github.com/snap-research/locomo) benchmark: months
+  of chats between two friends, then questions about them. Download the data first; it isn't
+  redistributed, and `evals/data/` is ignored by git. Each friend gets their own memory, and a
+  model grades every answer. Grading is lenient by default, like published results, and
+  `--grader strict` wants every part right.
+
+  Options:
+  - `--baseline`: the whole conversation in the prompt, for comparison
+  - `--prompt friends`: keeps life events, with dates
+  - `--store-sensitive`: stores sensitive details without asking
+  - `--per-category N`: a sample of N questions per category
+  - `--show-wrong N`: prints wrong answers with the memories they had
+  - `--past`: recalls past memories as well
+  - `--keep-messages`, `--message-top-k N`: keeps each friend's lines, and recalls N per friend
+  - `--rewrite`: rewrites each question into search queries first
+  - `--memory NAME`: reopens a memory built before, whatever the extraction prompt is now
+
+  Each run saves a `.summary.json`, and `evals/report.py` turns summaries into one HTML results
+  page. The page shows the score and mean context per question next to full context, by
+  question type, with a tab per benchmark, and what memwise saves in tokens and money
+  (`--price`, `--note`, `--reference` for a published result)
+- **LoCoMo results in the README** and on `docs/benchmarks.html`: 89.7 on all 1,540 questions
+  with about 4,900 tokens per question. On the same 382 questions, memwise scores 85.3 with 78%
+  fewer tokens than the whole conversation in the prompt (88.2), with the same answer model
+
 ## 0.4.0 (2026-11-26)
 
 An optional model that judges what the rules can't see, and fixes found by testing every

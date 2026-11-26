@@ -27,6 +27,8 @@ class Extractor(Protocol):
           conversation: every turn in order, {"role", "content"} dicts with a "ref" on user
                         turns. Assistant turns are context only: memories come from the user.
           known:        the user's current, non-sensitive memories, for reference.
+          now:          when the conversation happened (the manager's clock), to turn
+                        "yesterday" or "next month" into a date.
         """
 
 

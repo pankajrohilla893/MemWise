@@ -26,13 +26,14 @@ This page explains the design. For installation and usage, see the [README](../R
 
 | File | Responsibility |
 |---|---|
-| [`models.py`](../memwise/models.py) | `Candidate` (a proposal) and `Memory` (a stored claim) |
+| [`models.py`](../memwise/models.py) | `Candidate` (a proposal), `Memory` (a stored claim) and `SavedMessage` (a kept message) |
 | [`extractor.py`](../memwise/extractor.py) | The `Extractor` interface and the offline `RuleExtractor` |
-| [`llm.py`](../memwise/llm.py) | `LLMExtractor` and `LLMJudge` (any model), the `OpenAICompatible` and `OpenAICompatibleEmbedder` clients, the prompts and parsers |
+| [`llm.py`](../memwise/llm.py) | `LLMExtractor`, `LLMJudge` and `LLMQueryRewriter` (any model), the `OpenAICompatible` and `OpenAICompatibleEmbedder` clients, the prompts and parsers |
+| [`dates.py`](../memwise/dates.py) | Relative dates ("last weekend", "two weeks ago") worked out in code and written next to the words |
 | [`reconciler.py`](../memwise/reconciler.py) | The write gate, the ADD / CONFIRM / SUPERSEDE / RETRACT / FORGET / IGNORE decision, and the checks on an optional judge |
 | [`store.py`](../memwise/store.py) | SQLite storage, audit log, locking |
 | [`embed.py`](../memwise/embed.py) | The `Embedder` interface, the built-in `HashingEmbedder`, cosine similarity |
-| [`retriever.py`](../memwise/retriever.py) | The always-loaded profile and ranked retrieval |
+| [`retriever.py`](../memwise/retriever.py) | The always-loaded profile, ranked retrieval, kept-message search, and the `Rewriter` interface |
 | [`surfacer.py`](../memwise/surfacer.py) | The USE / MENTION / VERIFY / HOLD decision |
 | [`maintenance.py`](../memwise/maintenance.py) | Expire, merge, prune |
 | [`manager.py`](../memwise/manager.py) | `MemoryManager`: the API your product calls |
@@ -74,7 +75,9 @@ An extractor turns the conversation into `Candidate` objects. It never writes to
 Memories only come from the user's turns; the assistant's turns are context ("The second one,
 please." only makes sense after the question). `LLMExtractor` is also shown the user's most
 relevant stored memories (never sensitive ones), so it can resolve "I left last week" and reuse
-the stored predicate and value when something changes. A stored memory that comes back without
+the stored predicate and value when something changes. It is also told the date of the
+conversation (from the manager's clock), so "yesterday" or "last Sunday" is written into the
+memory as a date, and the memory still says when it happened months later. A stored memory that comes back without
 pointing at any user message is dropped as an echo, so it isn't counted as re-confirmed. `RuleExtractor` uses regular expressions.
 `LLMExtractor` makes one call per conversation to whatever model you connect, and reads the
 JSON it returns. Both return the same type, so everything after this step is identical.
@@ -154,6 +157,57 @@ score = 0.60 × relevance + 0.15 × recency + 0.15 × importance + 0.10 × confi
 - **recency** halves every 60 days since the memory was last confirmed or used.
 - **importance** is boosted when the user said "remember".
 
+**Past memories, only when asked.** `recall(..., include_past=True)` also searches what is no
+longer true: replaced, retracted and expired memories. It ranks them by relevance alone and
+keeps up to `MemoryConfig.past_top_k` (3) of them in `Recall.past`. This is for questions about
+the past, such as "where did I live before?" or "when did I start the course?". They get
+**PAST**, or **HOLD** under the same scope and sensitivity rules as current memories.
+`build_context()` lists them in a separate "No longer true" section, with when each was true
+and what replaced it, and tells the model never to treat them as true now. Two kinds of memory
+never come back here:
+- Forgotten memories are deleted.
+- Duplicates that maintenance merged are left out, because they are still true, as the copy
+  that was kept.
+
+**Kept messages, only when turned on.** With `MemoryConfig.keep_messages`, `ingest()` also keeps
+each of the user's messages word for word, with its date, an embedding, and the ids of the
+memories taken from it (or confirmed by it). Secrets are redacted first. When consent is
+required, a message the write gate refused a sensitive memory from isn't kept, and neither is
+"please forget that ...". A message gets the scope of the memories taken from it, and is marked
+sensitive if one of them was. At recall:
+- each shown memory gets the message it was first taken from, in `Recall.sources`;
+- other kept messages are searched with two rankings, embedding similarity and BM25 keywords
+  (names and titles that embeddings blur), plus a third when the query names a date or a month
+  ("on 13 October 2023", "in May 2023"): messages from then, most relevant first. The rankings
+  are combined by reciprocal rank fusion, and the best `message_top_k` that pass the scope and
+  sensitivity rules go in `Recall.messages`.
+
+This is what extraction can't give: the details nobody knew would be asked about. In LoCoMo,
+"Where did Caroline move from?" is answered by a line about her grandmother's necklace "from my
+home country, Sweden", which no extracted memory kept.
+
+**Relative dates are worked out in code.** Models count days badly: asked what "last weekend"
+meant in a chat on Monday 17 July 2023, they often answer a week off. `memwise.dates` finds
+English phrases with one clear meaning ("yesterday", "last Friday", "the week before last",
+"two weeks ago", "next month") and writes the dates after them, in brackets: "last weekend [the
+weekend before Mon 17 Jul 2023: Sat 15 Jul - Sun 16 Jul]". Weeks and weekends are said from the
+day, the way people say them. Weekends get their Saturday and Sunday; weeks don't ("last week
+[the week before Sun 16 Jul 2023]"), because said on a Sunday, "last week" can mean the calendar
+week before or the seven days just gone. Phrases that could mean more than one date
+("recently", "on Sunday", "next weekend") are left alone. It's
+applied twice: `LLMExtractor` sees the dated conversation (when it is given `now`), and
+`build_context()` shows kept messages dated, from the day each was said. The stored message
+stays as it was said.
+
+**Rewriting the request, only when turned on.** A request often doesn't sound like what answers
+it: "Would she enjoy a weekend outdoors?" against "Loves hiking in the mountains". With
+`MemoryManager(rewriter=LLMQueryRewriter(llm))`, `recall()` first asks the model for up to three
+search queries (outside the lock; cached; on failure, recall searches with the request alone).
+Every search then runs with the request and those queries: a memory's relevance is its best
+cosine over all of them, and for kept messages each query adds its own two rankings to the
+fusion. Sensitive memories and messages still need to match the request itself
+(`Scored.asked`): a query the model wrote can find one, but not bring it up.
+
 ### 2. Surfacing: retrieving a memory isn't the same as using it
 
 | Check, in order | Action |
@@ -199,6 +253,8 @@ exception: there, missing the memory is the bigger risk.
 - `forget(user_id, memory_id)` hard-deletes the memory and the older versions it replaced, then
   replaces their text in the audit log with `[forgotten]`.
 - `forget_all(user_id)` removes every memory and log entry for the user.
+- With kept messages, `forget` also deletes the messages the memory came from and every kept
+  message that names its value ("Berlin"), and `forget_all` deletes them all.
 
 The write gate also redacts sensitive candidates it ignores, so the log never keeps what the
 gate refused to store.
@@ -229,7 +285,8 @@ Searching raw chat transcripts with RAG returns "I live in Berlin" and "I just m
 side by side, and similarity alone can't tell which is current. In `memwise`, that decision
 is made when the fact is **written** (SUPERSEDE), so only current facts are ever retrieved.
 Each memory keeps `source_ref`, so you can still keep a searchable archive of raw transcripts
-next to it.
+next to it, and `MemoryConfig.keep_messages` does that for you: the user's own messages, under
+the memory rules for consent, scope, secrets and deletion, searched next to the memories.
 
 ## Design principles
 

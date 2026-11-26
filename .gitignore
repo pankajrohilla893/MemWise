@@ -22,3 +22,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Benchmark datasets and results (downloaded, not ours to redistribute)
+evals/data/

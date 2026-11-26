@@ -67,3 +67,22 @@ class Memory:
         if self.expires_at is not None and self.expires_at <= now:
             return False
         return True
+
+
+@dataclass
+class SavedMessage:
+    """Something the user said, kept word for word (only with `MemoryConfig.keep_messages`).
+
+    Extraction keeps what matters and drops the rest; a kept message still has the details
+    ("the book I read last year was Nothing Is Impossible"). Secrets are redacted first.
+    """
+
+    id: str
+    user_id: str
+    ref: str                  # the source_ref the message came in with
+    text: str
+    at: datetime              # when it was said (the manager's clock at ingest)
+    scope: str = "general"    # the scope of the memories taken from it, so work talk stays at work
+    sensitive: bool = False   # a sensitive memory was taken from it
+    memory_ids: list[str] = field(default_factory=list)  # memories taken from (or confirmed by) it
+    embedding: list[float] = field(default_factory=list, repr=False)

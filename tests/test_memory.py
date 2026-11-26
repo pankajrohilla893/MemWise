@@ -7,6 +7,7 @@ real products grow this into multi-session scripts with planted facts.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -19,9 +20,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from memwise import Candidate, Clock, MemoryConfig, MemoryManager, MemoryStore  # noqa: E402
-from memwise.llm import (JUDGE_SYSTEM, LLMError, LLMExtractor, LLMJudge,  # noqa: E402
+from memwise.llm import (JUDGE_SYSTEM, LLMError, LLMExtractor, LLMJudge, LLMQueryRewriter,  # noqa: E402
                          OpenAICompatible, OpenAICompatibleEmbedder, parse_memories,
-                         parse_verdicts)
+                         parse_queries, parse_verdicts)
 
 U = "u1"
 _STORES: list[MemoryStore] = []
@@ -229,6 +230,313 @@ class ReadPath(unittest.TestCase):
         say(self.mm, "I just moved to Lisbon.")
         r = self.mm.recall(U, "What's the weather like in my city?")
         self.assertNotIn("Berlin", [d.scored.memory.value for d in r.items])
+
+
+class PastMemories(unittest.TestCase):
+    """recall(include_past=True): what is no longer true, kept apart and labelled as history."""
+
+    def setUp(self):
+        self.mm = manager()
+        say(self.mm, "I live in Berlin.")
+        self.mm.clock.advance(30)
+        say(self.mm, "I just moved to Lisbon.")
+
+    def past(self, query: str, scope: str = "general") -> dict[str, str]:
+        r = self.mm.recall(U, query, scope=scope, include_past=True)
+        return {d.scored.memory.value: d.action for d in r.past}
+
+    def test_only_when_asked(self):
+        r = self.mm.recall(U, "Which city did I live in before Lisbon?")
+        self.assertEqual(r.past, [])
+        self.assertNotIn("Berlin", self.mm.build_context(r))
+
+    def test_a_replaced_memory_is_listed_as_history(self):
+        r = self.mm.recall(U, "Which city did I live in before Lisbon?", include_past=True)
+        self.assertEqual([(d.scored.memory.value, d.action) for d in r.past], [("Berlin", "PAST")])
+        self.assertNotIn("Berlin", [d.scored.memory.value for d in r.items])
+        context = self.mm.build_context(r)
+        history = context.split("## No longer true")[1]
+        self.assertIn("- Lives in Berlin (from 2026-01-01 until 2026-01-31, replaced by: Lives in Lisbon)",
+                      history)
+        self.assertIn("never treat them as true now", context)
+
+    def test_past_memories_keep_the_scope_and_sensitivity_rules(self):
+        self.mm.add(U, [Candidate(kind="fact", predicate="employer", value="Acme", text="Works at Acme",
+                                  scope="work")])
+        self.mm.clock.advance(1)
+        self.mm.add(U, [Candidate(kind="fact", predicate="employer", value="Globex",
+                                  text="Works at Globex", scope="work")])
+        self.assertEqual(self.past("Where did I work at Acme?", scope="personal").get("Acme"), "HOLD")
+        self.assertEqual(self.past("Where did I work at Acme?", scope="work").get("Acme"), "PAST")
+
+    def test_an_expired_memory_is_labelled_expired(self):
+        self.mm.add(U, [Candidate(kind="fact", predicate="traveling_to", value="Rome",
+                                  text="Traveling to Rome", ttl_days=5)])
+        self.mm.clock.advance(10)
+        r = self.mm.recall(U, "How was my trip to Rome?", include_past=True)
+        self.assertIn("Traveling to Rome (from 2026-01-31 until 2026-02-05, expired)",
+                      self.mm.build_context(r))
+
+    def test_merged_duplicates_are_not_history(self):
+        a = self.mm.add(U, [Candidate(kind="preference", predicate="likes", value="jazz",
+                                      text="Likes jazz")])[0].result
+        b = dataclasses.replace(a, id=self.mm.store.next_id(), text="Enjoys jazz music")
+        self.mm.store.insert(b)
+        a.valid_to, a.superseded_by = self.mm.clock.now(), b.id  # what maintenance does on a merge
+        self.mm.store.save(a)
+        self.assertEqual(len(self.mm.history(U)), 4)  # Berlin, Lisbon and both jazz rows
+        self.assertNotIn("jazz", self.past("What music do I like? Jazz?"))
+
+    def test_using_past_memories_is_not_recorded(self):
+        self.mm.recall(U, "Which city did I live in before Lisbon?", include_past=True)
+        berlin = next(m for m in self.mm.history(U) if m.value == "Berlin")
+        self.assertEqual(berlin.use_count, 0)
+
+
+def keeping(**config) -> MemoryManager:
+    clock = Clock(fixed_start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    return MemoryManager(store(), clock=clock, config=MemoryConfig(keep_messages=True, **config))
+
+
+class KeptMessages(unittest.TestCase):
+    """MemoryConfig.keep_messages: what the user said, word for word, next to the memories."""
+
+    def kept(self, mm: MemoryManager) -> list[str]:
+        return [s.text for s in mm.store.messages(U)]
+
+    def test_off_by_default(self):
+        mm = manager()
+        say(mm, "I live in Berlin.", "The book I read last year was Nothing Is Impossible.")
+        self.assertEqual(self.kept(mm), [])
+        r = mm.recall(U, "Which book did I read?")
+        self.assertEqual((r.messages, r.sources), ([], {}))
+
+    def test_a_memory_comes_with_the_message_it_came_from(self):
+        mm = keeping()
+        say(mm, "I live in Berlin, near the river.")
+        r = mm.recall(U, "Where do I live?")
+        berlin = next(d.scored.memory for d in r.used if d.scored.memory.value == "Berlin")
+        self.assertEqual(r.sources[berlin.id].text, "I live in Berlin, near the river.")
+        context = mm.build_context(r)
+        self.assertIn('said on Thursday 2026-01-01: "I live in Berlin, near the river."', context)
+        self.assertNotIn("said before", context)  # its own message isn't listed twice
+
+    def test_finds_details_no_memory_was_taken_from(self):
+        mm = keeping()
+        say(mm, "I live in Berlin.", "The book I read last year was Nothing Is Impossible.")
+        mm.clock.advance(3)
+        say(mm, "My sister visited on Sunday.")
+        r = mm.recall(U, "Which book did I read?")
+        self.assertEqual([x.message.text for x in r.messages][0],
+                         "The book I read last year was Nothing Is Impossible.")
+        context = mm.build_context(r)
+        self.assertIn("## What the user said before", context)
+        self.assertIn('- Thursday 2026-01-01: "The book I read last year [2025] was Nothing Is Impossible."', context)
+        self.assertEqual(len(mm.recall(U, "Which book?").messages), 1)  # top_k is a limit, not a quota
+        self.assertEqual(len(keeping(message_top_k=0).recall(U, "Which book?").messages), 0)
+
+    def test_a_named_date_finds_what_was_said_then(self):
+        mm = keeping(message_top_k=1)
+        say(mm, "Nice weather today.")
+        mm.clock.advance(2)
+        say(mm, "Here's my latest painting, all blue streaks.")
+        mm.clock.advance(40)
+        say(mm, "Here's another painting, a sunset.")
+        [x] = mm.recall(U, "What did I share on January 3, 2026?").messages
+        self.assertEqual(x.message.text, "Here's my latest painting, all blue streaks.")
+        [x] = mm.recall(U, "What did I paint in February 2026?").messages
+        self.assertEqual(x.message.text, "Here's another painting, a sunset.")
+
+    def test_secrets_are_redacted(self):
+        mm = keeping()
+        say(mm, "My card is 4242 4242 4242 4242 and my password is Sunflower!2024. I live in Paris.")
+        [text] = self.kept(mm)
+        self.assertNotIn("4242", text)
+        self.assertNotIn("Sunflower", text)
+        self.assertIn("I live in Paris.", text)
+
+    def test_a_sensitive_detail_without_consent_isnt_kept(self):
+        mm = keeping()
+        say(mm, "I was diagnosed with diabetes.", "I live in Paris.")
+        self.assertEqual(self.kept(mm), ["I live in Paris."])
+        mm = keeping(require_consent_for_sensitive=False)
+        say(mm, "I was diagnosed with diabetes.")
+        [s] = mm.store.messages(U)
+        self.assertTrue(s.sensitive)  # so it needs a strong reason to be shown, like its memory
+        self.assertEqual(mm.recall(U, "Suggest a film").messages, [])
+
+    def test_work_messages_stay_at_work(self):
+        mm = keeping()
+        say(mm, "I work at Acme, on the billing team.")
+        [s] = mm.store.messages(U)
+        self.assertEqual(s.scope, "work")  # the scope of the memory taken from it
+        r = mm.recall(U, "Where do I work, which team?", scope="work")
+        self.assertEqual([x.text for x in r.sources.values()], ["I work at Acme, on the billing team."])
+        r = mm.recall(U, "Where do I work, which team?", scope="personal")
+        self.assertEqual((r.messages, r.sources), ([], {}))
+
+    def test_forgetting_deletes_the_messages_too(self):
+        mm = keeping()
+        say(mm, "I live in Berlin.", "Berlin is cold this week.", "I like jazz.")
+        berlin = next(m for m in mm.current(U) if m.value == "Berlin")
+        mm.forget(U, berlin.id)
+        self.assertEqual(self.kept(mm), ["I like jazz."])
+        self.assertIn("and 2 kept messages", log_text(mm))
+
+    def test_a_forget_request_isnt_kept_and_deletes_what_it_names(self):
+        mm = keeping()
+        say(mm, "I live in Oslo.")
+        mm.clock.advance(1)
+        say(mm, "Please forget that I live in Oslo.")
+        self.assertEqual(self.kept(mm), [])
+        self.assertEqual(current_values(mm, "lives_in"), [])
+
+    def test_forget_all_deletes_them(self):
+        mm = keeping()
+        say(mm, "I live in Berlin.", "Nice weather today.")
+        mm.forget_all(U)
+        self.assertEqual(self.kept(mm), [])
+
+    def test_reembed_includes_messages(self):
+        mm = keeping()
+        say(mm, "Nice weather today.")
+        [before] = mm.store.messages(U)
+        before.embedding = [0.0]
+        mm.store.save_message(before)
+        mm.reembed(U)
+        [after] = mm.store.messages(U)
+        self.assertEqual(after.embedding, mm.embedder.embed("Nice weather today."))
+
+
+class RelativeDates(unittest.TestCase):
+    """memwise.dates: "last weekend" said on a Monday is the weekend just gone, worked out in code."""
+
+    def dated(self, text: str, y: int, m: int, d: int) -> str:
+        from memwise.dates import with_dates
+        return with_dates(text, datetime(y, m, d, 12, 0))
+
+    def test_days(self):
+        self.assertEqual(self.dated("I went yesterday.", 2023, 5, 8), "I went yesterday [Sun 7 May 2023].")
+        self.assertEqual(self.dated("the day before yesterday", 2023, 5, 8),
+                         "the day before yesterday [Sat 6 May 2023]")
+        self.assertEqual(self.dated("See you in 3 days", 2023, 12, 30), "See you in 3 days [Tue 2 Jan 2024]")
+
+    def test_named_weekdays(self):
+        # Thursday 25 May 2023: last Saturday is the 20th; next Sunday is the first Sunday after.
+        self.assertEqual(self.dated("I ran a race last Saturday", 2023, 5, 25),
+                         "I ran a race last Saturday [Sat 20 May 2023]")
+        self.assertEqual(self.dated("next Sunday", 2022, 9, 4), "next Sunday [Sun 11 Sep 2022]")
+
+    def test_weeks_and_weekends_are_said_from_the_day(self):
+        self.assertEqual(self.dated("We went camping last weekend.", 2023, 7, 17),
+                         "We went camping last weekend [the weekend before Mon 17 Jul 2023: "
+                         "Sat 15 Jul - Sun 16 Jul].")
+        # "last week" said on a Sunday may be the calendar week before or the seven days gone.
+        self.assertEqual(self.dated("last week", 2023, 7, 16), "last week [the week before Sun 16 Jul 2023]")
+        self.assertEqual(self.dated("two weeks ago", 2023, 5, 15), "two weeks ago [two weeks before Mon 15 May 2023]")
+        self.assertEqual(self.dated("last weekend", 2023, 1, 2),
+                         "last weekend [the weekend before Mon 2 Jan 2023: Sat 31 Dec 2022 - Sun 1 Jan 2023]")
+        self.assertEqual(self.dated("a party this weekend", 2022, 6, 3),
+                         "a party this weekend [the weekend after Fri 3 Jun 2022: Sat 4 Jun - Sun 5 Jun]")
+        self.assertIn("two weekends before Mon 17 Jul 2023: Sat 8 Jul - Sun 9 Jul",
+                      self.dated("two weekends ago", 2023, 7, 17))
+
+    def test_months_and_years(self):
+        self.assertEqual(self.dated("last year, and again next month", 2023, 1, 5),
+                         "last year [2022], and again next month [February 2023]")
+
+    def test_unclear_phrases_are_left_alone(self):
+        for text in ("I went on Sunday", "recently", "this Tuesday", "next weekend", "the other day"):
+            self.assertEqual(self.dated(text, 2023, 4, 10), text)
+        # Said on a Saturday, "over the weekend" may be this one.
+        self.assertEqual(self.dated("over the weekend", 2023, 4, 8), "over the weekend")
+
+    def test_already_dated_text_is_not_dated_twice(self):
+        once = self.dated("I went last week", 2023, 4, 12)
+        self.assertEqual(self.dated(once, 2023, 4, 12), once)
+
+
+class Rewrites:
+    """A rewriter for tests: fixed queries per request."""
+
+    def __init__(self, table: dict[str, list[str]]):
+        self.table, self.asked = table, []
+
+    def rewrite(self, query: str) -> list[str]:
+        self.asked.append(query)
+        return self.table.get(query, [])
+
+
+class QueryRewriting(unittest.TestCase):
+    """MemoryManager(rewriter=...): recall also searches with queries written for the request."""
+
+    OUTDOORS = "Would she enjoy a weekend outdoors?"
+
+    def mm(self, table: dict[str, list[str]], **config) -> MemoryManager:
+        clock = Clock(fixed_start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        return MemoryManager(store(), clock=clock, config=MemoryConfig(**config), rewriter=Rewrites(table))
+
+    def test_finds_what_answers_the_request_in_other_words(self):
+        hiking = Candidate("preference", "likes", "hiking", "Loves hiking in the mountains", explicit=True)
+        plain = manager()
+        plain.add(U, hiking)
+        self.assertEqual(plain.recall(U, self.OUTDOORS).used, [])
+        mm = self.mm({self.OUTDOORS: ["I love hiking in the mountains"]})
+        mm.add(U, hiking)
+        r = mm.recall(U, self.OUTDOORS)
+        self.assertEqual([d.scored.memory.value for d in r.used], ["hiking"])
+        self.assertEqual(r.searched, ["I love hiking in the mountains"])
+        self.assertLess(r.used[0].scored.asked_relevance, r.used[0].scored.relevance)
+
+    def test_a_rewrite_never_brings_up_a_sensitive_memory(self):
+        mm = self.mm({"Any plans for the weekend?": ["my asthma"]})
+        mm.add(U, Candidate("fact", "health", "asthma", "Has asthma", sensitive=True, explicit=True))
+        r = mm.recall(U, "Any plans for the weekend?")
+        self.assertEqual(r.used, [])
+        self.assertEqual([d.reason for d in r.items], ["sensitive and only loosely related"])
+
+    def test_finds_kept_messages_too(self):
+        gift = "What should I get her as a present?"
+        mm = self.mm({gift: ["a book I read"]}, keep_messages=True)
+        say(mm, "The book I read last year was Nothing Is Impossible.")
+        plain = keeping()
+        say(plain, "The book I read last year was Nothing Is Impossible.")
+        self.assertEqual(plain.recall(U, gift).messages, [])
+        [x] = mm.recall(U, gift).messages
+        self.assertIn("Nothing Is Impossible", x.message.text)
+
+    def test_a_failing_rewriter_leaves_recall_working(self):
+        class Broken:
+            def rewrite(self, query):
+                raise RuntimeError("offline")
+        mm = MemoryManager(store(), rewriter=Broken())
+        mm.add(U, Candidate("fact", "lives_in", "Berlin", "Lives in Berlin", explicit=True))
+        with self.assertLogs("memwise", "WARNING"):
+            r = mm.recall(U, "Where do I live?")
+        self.assertEqual(([d.scored.memory.value for d in r.used], r.searched), (["Berlin"], []))
+
+    def test_llm_rewriter_reads_caches_and_falls_back(self):
+        calls = []
+
+        def llm(system, messages):
+            calls.append(messages[0]["content"])
+            if "fail" in messages[0]["content"]:
+                raise LLMError("down")
+            return ('Sure:\n```json\n{"queries": ["I adopted a puppy", "my pets", "I adopted a puppy", '
+                    '"What pets does she have?", "a cat", "a dog"]}\n```')
+
+        rw = LLMQueryRewriter(llm)
+        self.assertEqual(rw.rewrite("What pets does she have?"), ["I adopted a puppy", "my pets", "a cat"])
+        self.assertEqual(rw.rewrite("What pets does she have?"), ["I adopted a puppy", "my pets", "a cat"])
+        self.assertEqual(len(calls), 1)  # cached
+        self.assertIn("<request>What pets does she have?</request>", calls[0])
+        with self.assertLogs("memwise", "WARNING"):
+            self.assertEqual(rw.rewrite("please fail"), [])
+        with self.assertLogs("memwise", "WARNING"):
+            self.assertEqual(rw.rewrite("please fail"), [])  # failures aren't cached
+        self.assertEqual(len(calls), 3)
+        with self.assertRaises(ValueError):
+            parse_queries("I can't help with that.")
 
 
 class SafetyMemories(unittest.TestCase):
@@ -547,6 +855,13 @@ class ConversationContext(unittest.TestCase):
         decisions = mm.ingest(U, [("s2:1", "What's on this weekend?"), ("s2:2", "I like jazz.")])
         self.assertEqual([d.op for d in decisions], ["ADD"])
         self.assertEqual(mm.store.get(berlin.id).last_confirmed, berlin.last_confirmed)
+
+    def test_the_extractor_is_told_the_date_of_the_conversation(self):
+        mm = manager()
+        mm.extractor = LLMExtractor(self.fake_llm())
+        mm.ingest(U, ["I went hiking yesterday."])
+        self.assertTrue(self.prompts[0].startswith("<today>Thursday 1 January 2026</today>"))
+        self.assertIn("user: I went hiking yesterday [Wed 31 Dec 2025].", self.prompts[0])
 
     def test_extractors_without_the_new_arguments_still_work(self):
         class OldStyle:

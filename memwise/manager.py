@@ -5,6 +5,9 @@
     build_context(recall)       turn the recall into text for your system prompt
     maintain_all()              on a schedule (nightly)                             -> upkeep
     forget(user_id, memory_id)  when the user asks                                  -> user control
+
+With `MemoryConfig.keep_messages`, what the user said is also kept word for word (secrets
+redacted) and searched at recall, next to the memories.
 """
 
 from __future__ import annotations
@@ -18,10 +21,12 @@ from typing import Any, Iterable, Union
 from . import maintenance, reconciler, retriever, surfacer
 from .clock import Clock, days_between
 from .config import MemoryConfig
+from .dates import with_dates
 from .embed import Embedder, HashingEmbedder, cosine
 from .extractor import Extractor, RuleExtractor
-from .models import Candidate, Memory
+from .models import Candidate, Memory, SavedMessage
 from .reconciler import Decision, Judge, Verdict
+from .retriever import Rewriter, ScoredMessage
 from .store import MemoryStore
 from .surfacer import SurfaceDecision
 
@@ -43,6 +48,14 @@ class Recall:
     scope: str
     profile: list[Memory] = field(default_factory=list)
     items: list[SurfaceDecision] = field(default_factory=list)
+    # Memories that are no longer true, with PAST or HOLD; empty unless recall(include_past=True).
+    past: list[SurfaceDecision] = field(default_factory=list)
+    # With MemoryConfig.keep_messages: the message each shown memory came from, by memory id,
+    # and other kept messages that match the query, best first. Held-back ones are left out.
+    sources: dict[str, SavedMessage] = field(default_factory=dict)
+    messages: list[ScoredMessage] = field(default_factory=list)
+    # With a rewriter: the queries searched as well as `query`.
+    searched: list[str] = field(default_factory=list)
 
     @property
     def used(self) -> list[SurfaceDecision]:
@@ -66,17 +79,22 @@ class MemoryManager:
                    or repeats a stored one ("Went vegetarian" vs "Loves steak"). `LLMJudge`
                    asks any model; see `reconciler` for when it is asked and how its answer
                    is checked. Off by default: then the rules decide everything.
+        rewriter:  optional. Writes search queries for each request, so recall also finds
+                   what answers it in other words ("Would she enjoy camping?" -> "I love
+                   hiking"). `LLMQueryRewriter` asks any model. Off by default.
     """
 
     def __init__(self, store: MemoryStore | None = None, extractor: Extractor | None = None,
                  clock: Clock | None = None, *, embedder: Embedder | None = None,
-                 config: MemoryConfig | None = None, judge: Judge | None = None):
+                 config: MemoryConfig | None = None, judge: Judge | None = None,
+                 rewriter: Rewriter | None = None):
         self.store = store or MemoryStore()
         self.extractor = extractor or RuleExtractor()
         self.clock = clock or Clock()
         self.embedder = embedder or HashingEmbedder()
         self.config = config or MemoryConfig()
         self.judge = judge
+        self.rewriter = rewriter
         # Reconciling reads then writes; the lock keeps two threads from
         # superseding the same memory at once.
         self._lock = threading.RLock()
@@ -88,8 +106,9 @@ class MemoryManager:
         `messages` can be plain strings or (source_ref, text) pairs (the user's messages), or
         the whole conversation as {"role", "content"} chat turns, assistant replies included.
         An extractor that accepts them (like `LLMExtractor`) also sees the assistant's turns,
-        to understand replies like "window, always", and the user's stored memories, to
-        understand "I left last week" and to reuse the same wording when something changes.
+        to understand replies like "window, always", the user's stored memories, to
+        understand "I left last week" and to reuse the same wording when something changes,
+        and the date (from the clock), to write "yesterday" as a date.
         """
         turns = _turns(messages)
         pairs = [(t["ref"], t["content"]) for t in turns if t["role"] == "user"]
@@ -101,8 +120,46 @@ class MemoryManager:
             extras["conversation"] = turns
         if "known" in takes and self.config.extraction_context_memories > 0:
             extras["known"] = self._known(user_id, pairs)
+        if "now" in takes:
+            extras["now"] = self.clock.now()
         candidates = self.extractor.extract(pairs, **extras)  # may call an LLM: outside the lock
-        return self.add(user_id, candidates)
+        decisions = self.add(user_id, candidates)
+        if self.config.keep_messages:
+            self._keep_messages(user_id, pairs, decisions)
+        return decisions
+
+    def _keep_messages(self, user_id: str, pairs: list[tuple[str, str]], decisions: list[Decision]) -> None:
+        """Keep what the user said, word for word, linked to the memories taken from it."""
+        by_ref: dict[str, list[Decision]] = {}
+        for d in decisions:
+            by_ref.setdefault(d.candidate.source_ref, []).append(d)
+        keep: list[tuple[str, str, list[Decision]]] = []
+        for ref, text in pairs:
+            ds = by_ref.get(ref, [])
+            if any(d.candidate.forget for d in ds):
+                continue  # "forget that I live in Oslo" names what is to be forgotten
+            if self.config.require_consent_for_sensitive and any(
+                    d.op == "IGNORE" and d.candidate.sensitive and not d.candidate.explicit for d in ds):
+                continue  # a sensitive detail the user didn't ask us to keep
+            if self.config.block_secrets:
+                text = reconciler.redact_secrets(text)
+            if text.strip():
+                keep.append((ref, text, ds))
+        if not keep:
+            return
+        embed_many = getattr(self.embedder, "embed_many", None)  # outside the lock: may be a network call
+        texts = [text for _, text, _ in keep]
+        vectors = embed_many(texts) if embed_many else [self.embedder.embed(t) for t in texts]
+        with self._lock:
+            now = self.clock.now()
+            for (ref, text, ds), vector in zip(keep, vectors):
+                ids = list(dict.fromkeys(d.result.id for d in ds if d.result is not None))
+                if any(self.store.get(i) is None for i in ids):
+                    continue  # forgotten in the meantime
+                scope = next((d.candidate.scope for d in ds if d.candidate.scope != "general"), "general")
+                self.store.insert_message(SavedMessage(
+                    id=self.store.next_id("s"), user_id=user_id, ref=ref, text=text, at=now, scope=scope,
+                    sensitive=any(d.candidate.sensitive for d in ds), memory_ids=ids, embedding=vector))
 
     def _known(self, user_id: str, pairs: list[tuple[str, str]]) -> list[Memory]:
         """Stored memories to show the extractor: most relevant first, never sensitive ones."""
@@ -157,20 +214,35 @@ class MemoryManager:
 
     # ---- read path -------------------------------------------------------
     def recall(self, user_id: str, query: str, scope: str = "general",
-               record_usage: bool = True) -> Recall:
+               record_usage: bool = True, *, include_past: bool = False) -> Recall:
         """Find what's relevant to `query` and decide USE / MENTION / VERIFY / HOLD for each.
 
         `scope` is the context of this conversation ("general", "work", "personal",
         or your own). Memories scoped to a different context are held back. Safety
         memories (allergies, by default) are always included, however unrelated they look.
+
+        `include_past=True` also finds memories that are no longer true (replaced, retracted
+        or expired), for questions about the past ("where did I live before?"). They are kept
+        in `Recall.past`, and `build_context` lists them apart, as history.
+
+        With a `rewriter`, recall also searches with the queries it writes (`Recall.searched`).
         """
+        searched = self._rewrite(query)  # may call a model: outside the lock
+        many = getattr(self.embedder, "embed_many", None)  # one request for all, if it batches
+        q, *also = many([query, *searched]) if many else [self.embedder.embed(x) for x in [query, *searched]]
         with self._lock:
             now = self.clock.now()
             prof = retriever.profile(self.store, user_id, now, self.config)
-            hits = retriever.retrieve(self.store, user_id, query, now, self.config,
-                                      self.embedder, exclude={m.id for m in prof})
+            hits = retriever.retrieve(self.store, user_id, query, now, self.config, self.embedder,
+                                      exclude={m.id for m in prof}, query_vector=q, also=also)
+            past = ([surfacer.decide_past(s, scope, self.config)
+                     for s in retriever.past(self.store, user_id, q, now, self.config, also)]
+                    if include_past else [])
             result = Recall(query, scope, prof,
-                            [surfacer.decide(s, scope, now, self.config) for s in hits])
+                            [surfacer.decide(s, scope, now, self.config) for s in hits], past,
+                            searched=searched)
+            if self.config.keep_messages:
+                self._recall_messages(result, user_id, q, list(zip(searched, also)))
 
             # Using a memory does NOT confirm it is still true; only the user
             # restating it moves last_confirmed.
@@ -179,6 +251,38 @@ class MemoryManager:
                     m.last_used, m.use_count = now, m.use_count + 1
                     self.store.save(m)
             return result
+
+    def _rewrite(self, query: str) -> list[str]:
+        if self.rewriter is None:
+            return []
+        try:
+            return [x for x in self.rewriter.rewrite(query) if x.strip()]
+        except Exception as e:  # a custom rewriter's failure must not break recall
+            _log.warning("memwise: the rewriter failed, so recall searched with the request alone: %s", e)
+            return []
+
+    def _recall_messages(self, result: Recall, user_id: str, q: list[float],
+                         also: list[tuple[str, list[float]]]) -> None:
+        """Fill in the message each shown memory came from, and other kept messages that match."""
+        saved = self.store.messages(user_id)
+        first: dict[str, SavedMessage] = {}
+        for s in saved:  # oldest first: a memory's source is the message it was first taken from
+            for i in s.memory_ids:
+                first.setdefault(i, s)
+        shown = [d.scored.memory for d in result.used] + [d.scored.memory for d in result.past
+                                                           if d.action == "PAST"]
+        for m in shown:
+            s = first.get(m.id)
+            if s is not None and not surfacer.hold_message(s, cosine(q, s.embedding), result.scope, self.config):
+                result.sources[m.id] = s
+        taken = {s.id for s in result.sources.values()}
+        for x in retriever.messages(self.store, user_id, result.query, q, self.config,
+                                    exclude=taken, saved=saved, limit=len(saved), also=also):
+            if len(result.messages) == self.config.message_top_k:
+                break
+            asked = cosine(q, x.message.embedding)  # sensitive ones must match the request itself
+            if not surfacer.hold_message(x.message, asked, result.scope, self.config):
+                result.messages.append(x)
 
     def build_context(self, recall: Recall, include_guidelines: bool = True, *,
                       about: str = "the user") -> str:
@@ -227,6 +331,19 @@ class MemoryManager:
                     how = (f"relevant, but may be out of date (last confirmed {age:.0f} days "
                            "ago): in your reply, briefly ask whether it's still true")
                 lines.append(f"- {m.text} ({since}) -> {how}")
+                self._said(lines, recall, m)
+
+        past = [d for d in recall.past if d.action == "PAST"]
+        if past:
+            heading("## No longer true (history, for questions about the past)")
+            for d in past:
+                lines.append(f"- {d.scored.memory.text} ({self._when_true(d.scored.memory)})")
+                self._said(lines, recall, d.scored.memory)
+
+        if recall.messages:
+            heading(f"## What {about} said before (word for word; may be relevant)")
+            for x in sorted(recall.messages, key=lambda x: x.message.at):
+                lines.append(f"- {_day(x.message.at)}: \"{with_dates(x.message.text, x.message.at)}\"")
 
         if lines and include_guidelines:
             lines += [
@@ -236,7 +353,29 @@ class MemoryManager:
                 "- If the user contradicts a memory, believe the user.",
                 "- Never invent memories that are not listed here.",
             ]
+            if past:
+                lines.append("- Memories that are no longer true are history: never treat them as true now.")
+            if recall.messages or recall.sources:
+                lines.append("- What was said is dated. Words like \"last week\" are followed by the dates they "
+                             "meant on that day, in [brackets].")
         return "\n".join(lines)
+
+    @staticmethod
+    def _said(lines: list[str], recall: Recall, m: Memory) -> None:
+        s = recall.sources.get(m.id)
+        if s is not None:
+            lines.append(f"    said on {_day(s.at)}: \"{with_dates(s.text, s.at)}\"")
+
+    def _when_true(self, m: Memory) -> str:
+        """"from 2026-01-01 until 2026-03-01, replaced by: Lives in Lisbon" for a past memory."""
+        ended = m.valid_to or m.expires_at
+        text = f"from {m.valid_from:%Y-%m-%d}" + (f" until {ended:%Y-%m-%d}" if ended else "")
+        newer = self.store.get(m.superseded_by) if m.superseded_by else None
+        if newer is not None:
+            return f"{text}, replaced by: {newer.text}"
+        if m.expires_at is not None and ended == m.expires_at:
+            return f"{text}, expired"  # maintenance closes expired memories at their expiry date
+        return f"{text}, then no longer true"
 
     # ---- upkeep ----------------------------------------------------------
     def maintain(self, user_id: str) -> list[str]:
@@ -262,23 +401,33 @@ class MemoryManager:
                     m.embedding = vec
                     self.store.save(m)
                     count += 1
+                saved = self.store.messages(u)
+                texts = [s.text for s in saved]
+                vectors = embed_many(texts) if embed_many and texts else [self.embedder.embed(t) for t in texts]
+                for s, vec in zip(saved, vectors):
+                    s.embedding = vec
+                    self.store.save_message(s)
             return count
 
     # ---- user control ----------------------------------------------------
     def forget(self, user_id: str, memory_id: str) -> list[str]:
-        """Hard-delete one memory (and its older versions), and scrub it from the log."""
+        """Hard-delete one memory (and its older versions), and scrub it from the log.
+
+        Kept messages (`MemoryConfig.keep_messages`) it came from, or that name it, are
+        deleted too."""
         with self._lock:
             m = self.store.get(memory_id)
             if m is None or m.user_id != user_id:
                 return []
-            removed = self.store.delete(memory_id)
-            self.store.redact_log(removed)
+            removed, messages = reconciler.forget(self.store, user_id, memory_id)
             self.store.log(user_id, self.clock.now(), "FORGET", memory_id,
-                           f"user deleted their {m.predicate} memory (removed {', '.join(removed)})")
+                           f"user deleted their {m.predicate} memory (removed {', '.join(removed)}"
+                           + (f", and {messages} kept messages)" if messages else ")"))
             return removed
 
     def forget_all(self, user_id: str) -> int:
-        """Delete everything stored about a user, including their audit log ("delete my data")."""
+        """Delete everything stored about a user, including their audit log and kept messages
+        ("delete my data")."""
         with self._lock:
             return self.store.delete_user(user_id)
 
@@ -310,6 +459,11 @@ def _turns(messages: Iterable[Message]) -> list[dict[str, str]]:
             turn["ref"] = str(ref) if ref else str(i)
         turns.append(turn)
     return turns
+
+
+def _day(when) -> str:
+    """"Thursday 2023-05-25": the weekday helps a model work out "last Sunday"."""
+    return f"{when:%A %Y-%m-%d}"
 
 
 def _keyword_args(fn: Any) -> set[str]:

@@ -18,7 +18,7 @@ whether a memory should be used at all.
 |---|---|---|
 | **Write** | A write gate drops small talk and anything sensitive the user didn't ask you to keep. Every new memory is compared with what's already stored. | "I was diagnosed with…" (said in passing) → **not stored**. "Remember I'm allergic to peanuts" → **stored** |
 | **Maintain** | New facts **replace** old ones and the history is kept. Trips and projects expire on their own. Old facts are flagged for re-checking. | "I moved to Lisbon" → Berlin is closed, not overwritten |
-| **Retrieve** | Memories are ranked by relevance, recency, importance and confidence, not similarity alone. Only *current* facts are searched. | Outdated facts never reach the prompt |
+| **Retrieve** | Memories are ranked by relevance, recency, importance and confidence, not similarity alone. Only *current* facts are searched, and past ones only when you ask. | Outdated facts never reach the prompt as if still true |
 | **Surface** | Each memory gets one of **USE** (quietly), **MENTION**, **VERIFY** or **HOLD** (left out of the prompt). Allergies are never held back. | Work facts stay out of a personal chat. "Still at Acme?" after 8 months. No peanut recipes for a peanut allergy |
 
 It also gives users real control: they can see what's stored, delete one memory, or delete
@@ -28,6 +28,71 @@ everything. Deleting also scrubs the audit log.
   and `/embeddings` API, or plug in your own functions. memwise never ties you to a provider.
 - **No dependencies in the core.** Pure Python and SQLite. `pip install` and go.
 - **Readable.** Every module starts with a comment explaining the idea it implements.
+
+## Benchmark results
+
+[LoCoMo](https://github.com/snap-research/locomo) is the long-conversation benchmark that memory
+systems are usually measured on: 10 chats between two friends, each spanning months (19 to 32
+sessions), and 1,540 questions about them.
+
+**memwise answers 89.7% of the 1,540 questions correctly, with about 4,900 tokens of memory per
+question.**
+
+| Question type | What it needs | Questions | memwise |
+|---|---|---|---|
+| Single hop | one fact | 841 | 93.1 |
+| Multi-hop | several facts together | 282 | 90.4 |
+| Temporal | when something happened | 321 | 87.5 |
+| Open-domain | an inference beyond what was said | 96 | 65.6 |
+| **All** | | **1,540** | **89.7** |
+
+### 78% fewer tokens than sending the whole conversation
+
+Without a memory system, you send the whole conversation with every request. On the same 382
+questions (up to 10 of each type per conversation), answered by the same model with the same
+prompt:
+
+| | Score | Tokens per question |
+|---|---|---|
+| The whole conversation in the prompt | 88.2 | 22,069 |
+| **memwise** | **85.3** | **4,809** |
+
+memwise keeps 97% of the score with 22% of the tokens:
+
+- **Each call costs 78% less for its memory.** Models bill input by the token. At an example price
+  of $1 per million input tokens, 1,000 questions cost **$4.81** of context with memwise and
+  $22.07 with the whole conversation. At your model's price, the saving is the same share.
+- **Building the memory is cheap.** One extraction call per chat session, about 3,500 tokens
+  each: 1.9 million tokens for all 10 conversations. Counting that, memwise used 73% fewer
+  tokens over the whole benchmark.
+- **It doesn't grow with the history.** The whole conversation gets longer with every chat, until
+  it no longer fits the model's context window. memwise sends about the same amount however long
+  the history is, set by `top_k` and `message_top_k`.
+
+The sample has more open-domain questions, the hardest type, than the full set (82 of 382,
+against 96 of 1,540), so both scores are lower here than on all 1,540 questions.
+
+### Compared with Mem0
+
+[Mem0 reports](https://mem0.ai/research) 92.5 on LoCoMo with 6,956 tokens per query. memwise
+scores 89.7, 2.8 points lower, with 4,899 tokens: **30% fewer**. Mem0 measured with its own
+models and grader, so this isn't a controlled comparison: some of the gap may come from the
+models rather than the memory.
+
+### How it was measured
+
+- Each friend gets their own memwise. Every session goes in, in order, with its date. memwise
+  recalls 10 memories and 30 of the friend's own lines (kept messages) per friend, including
+  memories that are no longer true, marked as history. Sensitive details are stored without
+  asking, because the questions are about them (by default memwise asks first).
+- gpt-6-luna extracts the memories, answers and grades. text-embedding-3-small makes the
+  embeddings. A model grades each answer against LoCoMo's, leniently, as published LoCoMo results
+  are graded. Adversarial questions (category 5) are left out, as in published results.
+- One run. Model output varies a little, so a repeat run can differ by about a point.
+
+The [results page](docs/benchmarks.html) has the charts, by question type. GitHub shows HTML
+files as source, so download it and open it in a browser. To run the benchmark yourself, see
+[Benchmark: LoCoMo](#benchmark-locomo).
 
 ---
 
@@ -238,15 +303,16 @@ open the same SQLite file.
 
 | Call | When to use it |
 |---|---|
-| `MemoryManager(store, extractor=..., embedder=..., config=..., judge=...)` | Once, at startup. `judge` is optional |
+| `MemoryManager(store, extractor=..., embedder=..., config=..., judge=..., rewriter=...)` | Once, at startup. `judge` and `rewriter` are optional |
 | `LLMExtractor(llm, system_prompt=..., scopes=...)` | Lets any model extract memories. `llm` is a function `(system, messages) -> str`. `system_prompt` and `scopes` are optional: your own extraction instructions and scope names (see [Use your own extraction prompt](#use-your-own-extraction-prompt)) |
 | `LLMJudge(llm)` | Optional. Lets a model say when a new memory replaces stored ones the rules can't link ("Went vegetarian" vs "Loves steak"); see [Let a model judge what the rules can't see](#let-a-model-judge-what-the-rules-cant-see) |
+| `LLMQueryRewriter(llm)` | Optional. Lets a model write search queries for each request, so recall finds what answers it in other words ("Would she enjoy camping?" finds "I love hiking"); see [Let a model rewrite the request](#let-a-model-rewrite-the-request) |
 | `OpenAICompatible(base_url=..., model=..., api_key=...)` | A ready-made `llm` for any `/chat/completions` API |
 | `OpenAICompatibleEmbedder(base_url=..., model=..., api_key=...)` | A ready-made embedder for any `/embeddings` API |
 | `MemoryConfig.for_embedding_model()` | Thresholds to start from with a real embedding model |
 | `ingest(user_id, messages)` | After a conversation. `messages` = the chat history (`{"role", "content"}` turns), or the user's messages as strings or `(source_ref, text)` pairs |
 | `add(user_id, candidates)` | Write memories you built yourself (a settings form, an import) |
-| `recall(user_id, message, scope="general")` | Before each model call. Returns a `Recall` |
+| `recall(user_id, message, scope="general")` | Before each model call. Returns a `Recall`. `include_past=True` also finds memories that are no longer true, for questions about the past ("where did I live before?") |
 | `build_context(recall)` | The memory section for your system prompt (`""` if there's nothing to add). `about="the project"` for memory that isn't about a person |
 | `current(user_id)` | "What do you know about me?" |
 | `history(user_id)` | Everything ever stored, including replaced and expired memories |
@@ -257,7 +323,13 @@ open the same SQLite file.
 | `store.logs(user_id)` | Audit log: every ADD / SUPERSEDE / EXPIRE / FORGET, with its reason |
 
 A `Recall` has `.profile` (always-loaded memories), `.items` (one decision per retrieved memory,
-with `.action`, `.reason` and `.scored.memory`), and `.used` (everything except HOLD).
+with `.action`, `.reason` and `.scored.memory`), and `.used` (everything except HOLD). With
+`include_past=True`, `.past` has the no-longer-true memories, each PAST or HOLD.
+`build_context` lists the PAST ones in a section of their own, "No longer true", with when
+each was true and what replaced it. With `MemoryConfig.keep_messages`, `.sources` has the
+message each shown memory came from, and `.messages` other kept messages that match (see
+[Keep what the user said](#keep-what-the-user-said-word-for-word)). With a rewriter,
+`.searched` has the queries it searched with besides the request.
 
 Every decision returned by `ingest()` and `add()` has `.op` (ADD, CONFIRM, SUPERSEDE, RETRACT,
 FORGET or IGNORE), `.reason`, `.target` (the stored memory it acts on), `.result` (the memory
@@ -321,6 +393,38 @@ Keep `duplicate_similarity` high: "Allergic to peanuts" and "Allergic to tree nu
 
 **If location matters to most requests,** load it into every prompt. "A dinner spot near me" is
 hard to link to "Lives in Lisbon" by meaning alone: `config.profile_predicates.add("lives_in")`.
+
+### Keep what the user said, word for word
+
+Extraction keeps what matters and drops the rest. When your product needs the details too
+("which book did I say I read last year?"), turn on kept messages:
+
+```python
+config = MemoryConfig.for_embedding_model(keep_messages=True, message_top_k=10)
+```
+
+Then `ingest()` also keeps each of the user's messages, and `recall()` returns two more things:
+
+- `.sources`: for each memory it shows, the message it came from. `build_context` puts it under
+  the memory, as `said on Thursday 2023-05-25: "..."`.
+- `.messages`: up to `message_top_k` other kept messages that match, found by meaning, by
+  shared keywords (a name or a title that embeddings blur), and by the date the message names
+  ("what did I say on 13 October 2023?", "in May 2023"). `build_context` lists them, dated,
+  under "What the user said before".
+
+Kept messages are shown as they were said, with relative dates worked out: on Monday 17 July
+2023, "we went camping last weekend" is shown as "last weekend [the weekend before Mon 17 Jul
+2023: Sat 15 Jul - Sun 16 Jul]", so the model doesn't have to count days (it often gets them a
+week off). `memwise.dates` does this in code, for English phrases with one clear meaning
+("yesterday", "last Friday", "two weeks ago", "next month"), and leaves vague ones ("recently",
+"on Sunday") alone. `LLMExtractor` gets the same dates, so memories are dated correctly too.
+
+It stores more about the user, so it's off by default. Secrets are redacted before a message is
+kept. When consent is required, a message that the write gate refused a sensitive memory from
+isn't kept, and neither is "please forget that ...". Kept messages follow the scope and
+sensitivity rules of the memories taken from them. `forget()` deletes the messages a memory
+came from and those that name it, and `forget_all()` deletes them all. A model can miss a
+sensitive detail, so turn this on where keeping chat history is acceptable.
 
 ### Use your own extraction prompt
 
@@ -390,6 +494,33 @@ or DELETE (for "no longer true"). memwise keeps the decision:
 Change what it's shown with `config.judge_related` (how many similar memories, default 5) and
 `config.judge_min_similarity`, or pass your own instructions with
 `LLMJudge(llm, system_prompt=...)`. Any object with a `judge(requests)` method works too.
+
+### Let a model rewrite the request
+
+Recall finds memories that mean the same thing as the request, or share its rare words. Some
+requests don't sound like what answers them: "Would she enjoy a weekend outdoors?" is answered by
+"Loves hiking in the mountains", and "What pets does he have?" by "We adopted a puppy". An
+optional rewriter asks a model what to search for:
+
+```python
+from memwise import LLMExtractor, LLMQueryRewriter, MemoryManager
+
+memory = MemoryManager(store, extractor=LLMExtractor(llm), embedder=embedder, config=config,
+                       rewriter=LLMQueryRewriter(llm))
+```
+
+- **Recall searches with the request and up to three queries the model writes** (in
+  `Recall.searched`). A memory's relevance is its best match over all of them, and with kept
+  messages each query adds its own rankings.
+- **Sensitive memories still have to match the request itself.** A query the model writes can
+  find a memory, but it can't bring up a sensitive one the request alone wouldn't have.
+- **One extra model call per new request,** made outside the manager's lock. Answers are cached,
+  and if the call fails, a warning is logged and recall searches with the request alone. It adds
+  the model's response time to every new request, so it suits questions about the past more than
+  live chat.
+
+Pass your own instructions with `LLMQueryRewriter(llm, system_prompt=...)`, or any object with a
+`rewrite(request) -> list[str]` method.
 
 ### Write your own extractor
 
@@ -524,6 +655,44 @@ python evals/judge.py --repeat 3       # --no-judge runs the same scenarios with
 python evals/scenarios.py --judge
 ```
 
+### Benchmark: LoCoMo
+
+[`evals/locomo.py`](evals/locomo.py) runs memwise on [LoCoMo](https://github.com/snap-research/locomo),
+the long-conversation benchmark that Mem0 and others quote. It has 10 chats between two friends,
+each spanning months (19 to 32 sessions), and 1,540 questions about them, plus 446 adversarial
+ones. Each friend gets their own memory, a model answers from what memwise recalls, and the
+same model grades the answer. The data isn't included, so download it once (2.8 MB):
+
+```bash
+mkdir -p evals/data
+curl -L -o evals/data/locomo10.json https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json
+python evals/locomo.py --conv conv-26      # one conversation; leave --conv out for all 10
+python evals/locomo.py --prompt friends --store-sensitive --past --keep-messages --top-k 10 --message-top-k 30
+```
+
+Options:
+- `--baseline` also answers with the whole conversation in the prompt, for comparison.
+- `--prompt friends` adds lines for chats between friends to the built-in prompt.
+- `--store-sensitive` stores sensitive details without asking.
+- `--past` recalls memories that are no longer true as well, as history.
+- `--keep-messages` keeps each friend's lines word for word (`MemoryConfig.keep_messages`), and
+  `--message-top-k N` sets how many matching lines are recalled per friend (default 10).
+- `--rewrite` has the model write search queries for each question (`LLMQueryRewriter`).
+- `--per-category N` runs a sample: up to N questions of each type per conversation.
+- `--memory NAME` reopens a memory built before (a folder in `evals/data/locomo-memory/`), to
+  compare recall settings on the same memory after the extraction prompt changed.
+- `--show-wrong N` prints wrong answers with the memories they had.
+
+Every answer is saved in `evals/data/locomo-results/`, with a `.summary.json` of the scores.
+[`evals/report.py`](evals/report.py) turns summaries into a results page like
+[docs/benchmarks.html](docs/benchmarks.html): memwise's score and context size next to the whole
+conversation in the prompt, by question type, and what it saves. `--price` sets the example price
+per million input tokens, and `--reference` adds a result someone else published.
+
+```bash
+python evals/report.py evals/data/locomo-results/*.summary.json --out benchmarks.html
+```
+
 ## How it works
 
 Read [docs/how-it-works.md](docs/how-it-works.md) for the design: the data model, the write and
@@ -545,7 +714,11 @@ read paths, maintenance, deletion, and how memory differs from RAG.
   prompt, in every scope, with an instruction to respect them and only bring them up when they
   matter. Add your own safety predicates, or pass an empty set to turn this off.
 - **Deletion is complete.** `forget` hard-deletes the memory and its older versions, and scrubs
-  it from the audit log. `forget_all` removes everything about the user.
+  it from the audit log. `forget_all` removes everything about the user. With kept messages,
+  `forget` also deletes the messages the memory came from and those that name it.
+- **Nothing is kept word for word unless you ask.** `MemoryConfig.keep_messages` is off by
+  default. When it's on, secrets are redacted first, and a message is kept under the same
+  consent, scope and sensitivity rules as the memories taken from it.
 - **Protection against memory poisoning.** The extraction prompt treats conversation text as
   data, not instructions, so pasted text can't plant memories.
 - **Your data stays with you.** Memories live in your own SQLite file. Nothing is sent anywhere
@@ -562,6 +735,9 @@ This is an early release (0.4). Things to know before relying on it:
   thresholds for it with `examples/tune_embedder.py`.
 - **SQLite only.** It works for one server, or several processes on one machine. For many servers,
   a Postgres store would be the next step (the schema maps over directly).
+- **Search is a scan.** Recall compares the query with every memory of the user (and every kept
+  message, with `keep_messages`) in Python. That's quick for hundreds or a few thousand per user;
+  for long histories, a vector index (pgvector, sqlite-vec) would be the next step.
 - **Extraction quality depends on your model.** Small models sometimes skip fields or return
   loose JSON. The parser forgives that, but try your model on real conversations before
   shipping. The built-in client is tested against a local fake server, not a live provider.

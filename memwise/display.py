@@ -18,7 +18,8 @@ _CODES = {
 OP_COLORS = {
     "ADD": "green", "CONFIRM": "blue", "SUPERSEDE": "magenta", "RETRACT": "yellow",
     "IGNORE": "dim", "USE": "green", "MENTION": "cyan", "VERIFY": "yellow", "HOLD": "dim",
-    "EXPIRE": "yellow", "MERGE": "blue", "PRUNE": "red", "FORGET": "red",
+    "EXPIRE": "yellow", "MERGE": "blue", "PRUNE": "red", "FORGET": "red", "PAST": "magenta",
+    "SAID": "cyan",
 }
 
 
@@ -75,6 +76,13 @@ def recall(r: Recall) -> None:
         nums = c(f"rel {s.relevance:.2f}  score {s.score:.2f}", "dim")
         print(f"  {op(d.action)} {s.memory.id:<4} {fit(s.memory.text, 46):<46} {nums}")
         print(c(f"  {'':9} {'':4} why: {d.reason}", "dim"))
+    for d in r.past:
+        s = d.scored
+        print(f"  {op(d.action)} {s.memory.id:<4} {fit(s.memory.text, 46):<46} "
+              + c(f"rel {s.relevance:.2f}  (no longer true)", "dim"))
+    for x in r.messages:
+        print(f"  {op('SAID')} {x.message.id:<4} {fit(repr(x.message.text), 46):<46} "
+              + c(f"rel {x.relevance:.2f}  keywords {x.keywords:.1f}", "dim"))
 
 
 def memory_table(memories: list[Memory], now: datetime, show_history: bool = False) -> None:

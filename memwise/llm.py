@@ -41,8 +41,10 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
+from datetime import datetime
 from typing import Any, Callable, Iterable, TypeVar
 
+from .dates import with_dates
 from .models import KINDS, Candidate, Memory
 from .reconciler import JUDGE_OPS, JudgeRequest, Verdict
 
@@ -56,7 +58,8 @@ SCOPES = ("general", "work", "personal")
 
 EXTRACTION_SYSTEM = """You extract long-term memories about a user from one chat session.
 
-You get the <conversation>, and sometimes <known_memories>: what is already stored about the user.
+You get the <conversation>, and sometimes <today> (when it happened) and <known_memories>: what is
+already stored about the user.
 - Take memories only from the user's lines (the ones with a [ref]). The assistant's lines are
   context, to understand what the user means ("Window, always." after "Window or aisle?").
   Never store something only because the assistant said or assumed it.
@@ -91,6 +94,13 @@ For each memory:
   ("hiking", not "weekend hiking"; "Lisbon"; "tea"). Put those details in text instead.
 - text: a short statement of this one memory only, with no pronouns ("Lives in Lisbon",
   "Name is Ana"). Give each fact its own memory: a job_title memory doesn't name the employer.
+  When a memory is about something at a particular time (an event, a trip, a plan), say when
+  in text as a date worked out from <today>, never as "yesterday" or "next month": on
+  Thursday 25 May 2023, "yesterday" is "on 24 May 2023", "last Sunday" is "on 21 May 2023",
+  "last week" is "in the week before 25 May 2023" and "next month" is "in June 2023". Where the
+  conversation already gives the dates in [brackets] after a phrase, use those. Leave dates out
+  of lasting facts, routines and preferences ("Runs 10k every morning" has no date), and never
+  guess a date nobody gave.
 - scope: "work" only for the job, colleagues and work projects; "personal" only for private
   matters the user may not want raised in a work chat (family, relationships, home life).
   Everything else is "general", including their name, where they live, their address, diet,
@@ -193,27 +203,36 @@ class LLMExtractor:
 
     def extract(self, messages: Iterable[tuple[str, str]], *,
                 conversation: list[dict[str, str]] | None = None,
-                known: list[Memory] | None = None) -> list[Candidate]:
+                known: list[Memory] | None = None,
+                now: datetime | None = None) -> list[Candidate]:
         messages = list(messages)
         if not messages:
             return []
         turns = conversation or [{"role": "user", "content": text, "ref": ref} for ref, text in messages]
         lines = []
         for t in turns:
+            # "last weekend" -> "last weekend [the weekend before ...: Sat 15 Jul - Sun 16 Jul]":
+            # worked out in code, because models often count a week off.
             if t["role"] == "user":
-                lines.append(f"[{t['ref']}] user: {t['content']}")
+                lines.append(f"[{t['ref']}] user: {self._dated(t['content'], now)}")
             else:
                 text = t["content"]
                 if len(text) > self.assistant_chars:
                     text = text[: self.assistant_chars] + " …"
-                lines.append(f"assistant: {text}")
+                lines.append(f"assistant: {self._dated(text, now)}")
         prompt = "<conversation>\n" + "\n".join(lines) + "\n</conversation>"
         if known:
             listed = "\n".join(f"- {m.predicate}: {m.value} ({m.text})" for m in known)
             prompt = f"<known_memories>\n{listed}\n</known_memories>\n\n{prompt}"
+        if now is not None:
+            prompt = f"<today>{now:%A} {now.day} {now:%B %Y}</today>\n\n{prompt}"
         reply = self.llm(self.system_prompt, [{"role": "user", "content": prompt}])
         return _drop_echoes(parse_memories(reply, scopes=self.scopes),
                             refs=[ref for ref, _ in messages], known=known or [])
+
+    @staticmethod
+    def _dated(text: str, now: datetime | None) -> str:
+        return text if now is None else with_dates(text, now)
 
 
 def _drop_echoes(candidates: list[Candidate], refs: list[str], known: list[Memory]) -> list[Candidate]:
@@ -415,6 +434,86 @@ def parse_verdicts(reply: str, count: int) -> list[Verdict | None]:
         out[position] = Verdict(op, ids, _str(item.get("reason")))
     return out
 
+
+
+REWRITE_SYSTEM = """You help search a user's long-term memory: short notes about the user, and the user's own
+messages from past chats, word for word. You get a request; write what to search for.
+
+Search finds text that means the same thing, and text that shares rare words. A request often
+doesn't sound like what answers it: "What pets does she have?" is answered by "We adopted a puppy
+named Max", and "Would he enjoy a hiking trip?" by what he said about the outdoors, sports or
+travel. So don't restate the request. Write up to three short queries that sound like what the
+user would have said, each about a different thing the answer could rest on:
+- in the user's own words, in the first person, without their name ("I collect vintage
+  cameras", not "Ana's hobbies");
+- for a request that needs an inference (would they, are they likely to, what kind of person),
+  the facts it would rest on: their interests, work, plans, values, family or experiences;
+- for a request that wants a list ("which books has she read?"), the kinds of thing to find;
+- names, titles and places from the request, kept exactly.
+Don't answer the request and don't invent details: only say what to look for.
+
+Reply with JSON only: {"queries": ["...", "..."]}"""
+
+
+class LLMQueryRewriter:
+    """A `Rewriter` that asks any LLM what to search for, for requests that don't sound like
+    what answers them ("Would she enjoy camping?" is answered by what she said about hiking).
+
+        mm = MemoryManager(store, extractor=LLMExtractor(llm), rewriter=LLMQueryRewriter(llm))
+
+    `recall()` then searches with the request and these queries. It makes one call per new
+    request (answers are cached), outside the lock. If the call fails or the reply can't be
+    read, it logs a warning and recall searches with the request alone.
+
+    Args:
+        llm:           a function `(system, messages) -> str`, or an `OpenAICompatible` client.
+        system_prompt: the instructions. Defaults to `REWRITE_SYSTEM`.
+        max_queries:   queries kept from each reply (default 3).
+        cache_size:    requests remembered (default 1024).
+    """
+
+    def __init__(self, llm: LLM, *, system_prompt: str = REWRITE_SYSTEM, max_queries: int = 3,
+                 cache_size: int = 1024):
+        self.llm = llm
+        self.system_prompt = system_prompt
+        self.max_queries = max_queries
+        self.cache_size = cache_size
+        self._cache: OrderedDict[str, list[str]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def rewrite(self, query: str) -> list[str]:
+        key = query.strip()
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return list(self._cache[key])
+        try:
+            reply = self.llm(self.system_prompt, [{"role": "user", "content": f"<request>{key}</request>"}])
+            queries = parse_queries(reply, key)[: self.max_queries]
+        except (LLMError, ValueError) as e:
+            _log.warning("memwise: rewriting the request failed, so recall searched with it alone: %s", e)
+            return []
+        with self._lock:
+            self._cache[key] = queries
+            while len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+        return list(queries)
+
+
+def parse_queries(reply: str, request: str = "") -> list[str]:
+    """The search queries in a rewriter's reply, in order, without repeats or the request itself.
+    Raises ValueError if there's no `{"queries": [...]}` JSON in it."""
+    items = _find_items((reply or "").strip(), "queries")
+    if items is None:
+        raise ValueError(f"The reply has no queries JSON in it: {(reply or '')[:200]!r}")
+    seen = {request.strip().lower()}
+    out = []
+    for q in items:
+        q = _str(q)
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+    return out
 
 # --------------------------------------------------------------------------- ready-made clients
 

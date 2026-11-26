@@ -6,6 +6,8 @@ Design choices worth copying:
     "used to live in Berlin" and can explain why the memory changed.
   * `memory_log` records every operation (ADD, SUPERSEDE, EXPIRE, FORGET, ...).
     It is how you debug memory ("why does it think I like coffee?").
+  * `messages` holds what the user said, word for word, only with
+    `MemoryConfig.keep_messages`; each row lists the memories taken from it.
   * The schema maps directly onto Postgres + pgvector if you outgrow SQLite.
 
 Concurrency: one `MemoryStore` can be shared by threads in a single process (for
@@ -23,7 +25,7 @@ import threading
 from dataclasses import fields
 from datetime import datetime
 
-from .models import Memory
+from .models import Memory, SavedMessage
 
 _DATETIME_FIELDS = {"valid_from", "last_confirmed", "valid_to", "expires_at", "last_used"}
 
@@ -64,6 +66,20 @@ CREATE TABLE IF NOT EXISTS memory_log (
 CREATE INDEX IF NOT EXISTS idx_log_user ON memory_log (user_id);
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- What the user said, word for word; only written with MemoryConfig.keep_messages.
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    at TEXT NOT NULL,
+    text TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    sensitive INTEGER NOT NULL,
+    memory_ids TEXT NOT NULL,
+    embedding TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_user ON messages (user_id);
 """
 
 _COLUMNS = [f.name for f in fields(Memory)]
@@ -100,7 +116,7 @@ class MemoryStore:
 
     # ---- ids -------------------------------------------------------------
     @_locked
-    def next_id(self) -> str:
+    def next_id(self, prefix: str = "m") -> str:
         # BEGIN IMMEDIATE takes SQLite's write lock before reading the counter,
         # so two processes sharing one file can never hand out the same id.
         self.db.execute("BEGIN IMMEDIATE")
@@ -116,7 +132,7 @@ class MemoryStore:
         except BaseException:
             self.db.rollback()
             raise
-        return f"m{n}"
+        return f"{prefix}{n}"
 
     # ---- rows <-> objects ------------------------------------------------
     @staticmethod
@@ -191,6 +207,42 @@ class MemoryStore:
         """Delete every memory and log entry for a user. Returns the number of memories removed."""
         cur = self.db.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
         self.db.execute("DELETE FROM memory_log WHERE user_id = ?", (user_id,))
+        self.db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        self.db.commit()
+        return cur.rowcount
+
+    # ---- kept messages (MemoryConfig.keep_messages) ------------------------
+    @_locked
+    def insert_message(self, s: SavedMessage) -> None:
+        self.db.execute(
+            "INSERT INTO messages (id, user_id, ref, at, text, scope, sensitive, memory_ids, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (s.id, s.user_id, s.ref, s.at.isoformat(), s.text, s.scope, int(s.sensitive),
+             json.dumps(s.memory_ids), json.dumps(s.embedding)))
+        self.db.commit()
+
+    @_locked
+    def save_message(self, s: SavedMessage) -> None:
+        self.db.execute("UPDATE messages SET text = ?, memory_ids = ?, embedding = ? WHERE id = ?",
+                        (s.text, json.dumps(s.memory_ids), json.dumps(s.embedding), s.id))
+        self.db.commit()
+
+    @_locked
+    def messages(self, user_id: str) -> list[SavedMessage]:
+        """Every kept message for this user, oldest first."""
+        rows = self.db.execute(
+            "SELECT * FROM messages WHERE user_id = ? ORDER BY at, rowid", (user_id,)).fetchall()
+        return [SavedMessage(id=r["id"], user_id=r["user_id"], ref=r["ref"], text=r["text"],
+                             at=datetime.fromisoformat(r["at"]), scope=r["scope"],
+                             sensitive=bool(r["sensitive"]), memory_ids=json.loads(r["memory_ids"]),
+                             embedding=json.loads(r["embedding"])) for r in rows]
+
+    @_locked
+    def delete_messages(self, message_ids: list[str]) -> int:
+        if not message_ids:
+            return 0
+        marks = ", ".join("?" for _ in message_ids)
+        cur = self.db.execute(f"DELETE FROM messages WHERE id IN ({marks})", message_ids)
         self.db.commit()
         return cur.rowcount
 

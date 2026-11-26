@@ -133,6 +133,20 @@ def secret_kind(c: Candidate) -> str | None:
     return None
 
 
+_REDACTED = "[secret removed]"
+
+
+def redact_secrets(text: str) -> str:
+    """The same text with every secret `secret_kind` looks for replaced, for kept messages."""
+    def card(m: re.Match) -> str:
+        digits = re.sub(r"\D", "", m.group())
+        return _REDACTED if 13 <= len(digits) <= 19 and _luhn(digits) else m.group()
+    text = _CARD.sub(card, text)
+    for pattern in (_TOKEN, _SECRET_STATED, _IBAN, _SSN):
+        text = pattern.sub(_REDACTED, text)
+    return text
+
+
 def write_gate(c: Candidate, config: MemoryConfig = DEFAULT_CONFIG) -> str | None:
     """Return a reason to NOT store this candidate, or None to keep it."""
     if config.block_secrets:
@@ -370,6 +384,20 @@ def _by_rules(c: Candidate, store: MemoryStore, user_id: str, now: datetime,
     return Decision("ADD", c, reason="new information")
 
 
+def forget(store: MemoryStore, user_id: str, memory_id: str) -> tuple[list[str], int]:
+    """Hard-delete a memory with its older versions, scrub them from the log, and delete the
+    kept messages they came from or that name them. Returns the ids removed and the number
+    of messages deleted."""
+    chain = {m.id: m for m in store.all(user_id)}
+    removed = store.delete(memory_id)
+    store.redact_log(removed)
+    names = {v for v in (chain[i].value.strip().lower() for i in removed if i in chain) if len(v) >= 4}
+    doomed = [s.id for s in store.messages(user_id)
+              if set(s.memory_ids) & set(removed)
+              or any(re.search(rf"\b{re.escape(v)}\b", s.text.lower()) for v in names)]
+    return removed, store.delete_messages(doomed)
+
+
 def apply(d: Decision, store: MemoryStore, user_id: str, now: datetime,
           embedder: Embedder = _DEFAULT_EMBEDDER) -> Decision:
     c = d.candidate
@@ -395,10 +423,10 @@ def apply(d: Decision, store: MemoryStore, user_id: str, now: datetime,
 
     if d.op == "FORGET":
         old = _target(d)
-        removed = store.delete(old.id)
-        store.redact_log(removed)
+        removed, messages = forget(store, user_id, old.id)
         store.log(user_id, now, "FORGET", old.id,
-                  f"user asked to forget their {old.predicate} memory (removed {', '.join(removed)})")
+                  f"user asked to forget their {old.predicate} memory (removed {', '.join(removed)}"
+                  + (f", and {messages} kept messages)" if messages else ")"))
         return d
 
     if d.op == "RETRACT":

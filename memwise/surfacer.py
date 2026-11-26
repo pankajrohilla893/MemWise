@@ -8,6 +8,10 @@ of four actions:
     VERIFY   it may be out of date; check before relying on it ("are you still at Acme?")
     HOLD     keep it out of the prompt entirely
 
+and memories that are no longer true, which only come back when asked for
+(`recall(include_past=True)`), get PAST (listed as history) or HOLD. Kept messages
+(`MemoryConfig.keep_messages`) follow the same scope and sensitivity rules.
+
 HOLD matters most. A memory that isn't in the prompt can't leak, so the model
 never has to be trusted to "not mention" something.
 
@@ -24,6 +28,7 @@ from datetime import datetime
 
 from .clock import days_between
 from .config import DEFAULT_CONFIG, MemoryConfig
+from .models import SavedMessage
 from .retriever import Scored
 
 
@@ -47,7 +52,7 @@ def decide(s: Scored, scope: str, now: datetime,
     if m.scope != "general" and scope != m.scope:
         return SurfaceDecision(s, "HOLD", f"belongs to the {m.scope} context; this chat is {scope}")
 
-    if m.sensitive and s.relevance < config.sensitive_relevant_enough:
+    if m.sensitive and s.asked_relevance < config.sensitive_relevant_enough:
         return SurfaceDecision(s, "HOLD", "sensitive and only loosely related")
 
     if s.relevance < config.relevant_enough:
@@ -67,3 +72,28 @@ def decide(s: Scored, scope: str, now: datetime,
         return SurfaceDecision(s, "USE", "relevant; apply it without reciting the sensitive detail")
 
     return SurfaceDecision(s, "USE", "relevant; personalize without announcing it")
+
+
+def hold_message(s: SavedMessage, relevance: float, scope: str,
+                 config: MemoryConfig = DEFAULT_CONFIG) -> str | None:
+    """Why a kept message stays out of the prompt, or None to show it. The scope and
+    sensitivity rules are the memories': a message is scoped and sensitive like the
+    memories taken from it."""
+    if s.scope != "general" and scope != s.scope:
+        return f"said in the {s.scope} context; this chat is {scope}"
+    if s.sensitive and relevance < config.sensitive_relevant_enough:
+        return "sensitive and only loosely related"
+    return None
+
+
+def decide_past(s: Scored, scope: str, config: MemoryConfig = DEFAULT_CONFIG) -> SurfaceDecision:
+    """For a memory that is no longer true: PAST, or HOLD under the same scope and
+    sensitivity rules as current memories. Safety rules don't apply: it's history."""
+    m = s.memory
+    if m.scope != "general" and scope != m.scope:
+        return SurfaceDecision(s, "HOLD", f"belongs to the {m.scope} context; this chat is {scope}")
+    if m.sensitive and s.asked_relevance < config.sensitive_relevant_enough:
+        return SurfaceDecision(s, "HOLD", "sensitive and only loosely related")
+    if s.relevance < config.relevant_enough:
+        return SurfaceDecision(s, "HOLD", "not relevant enough to this request")
+    return SurfaceDecision(s, "PAST", "no longer true; listed for questions about the past")

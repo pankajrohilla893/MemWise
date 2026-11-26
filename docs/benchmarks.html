@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>memwise benchmarks</title><style>
+:root { color-scheme: dark; --page:#0b1120; --surface:#111827; --line:#1f2937; --ink:#f1f5f9;
+  --ink-2:#cbd5e1; --muted:#8b94a7; --memwise:#13a898; --full:#646d80; --accent:#5eead4; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--page); color:var(--ink); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+  padding:40px 20px 64px; }
+main { max-width:920px; margin:0 auto; }
+header { text-align:center; margin-bottom:28px; }
+header .brand { font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); font-weight:600; }
+header h1 { font-size:34px; font-weight:700; letter-spacing:-.02em; margin-top:6px; }
+nav { display:flex; justify-content:center; gap:4px; background:var(--surface); border:1px solid var(--line);
+  border-radius:999px; padding:5px; width:max-content; margin:22px auto 0; }
+nav button { font:inherit; font-size:14px; color:var(--ink-2); background:none; border:0; border-radius:999px;
+  padding:7px 16px; cursor:pointer; }
+nav button[aria-selected="true"] { background:var(--memwise); color:#fff; font-weight:600; }
+nav button:disabled { color:var(--muted); cursor:default; }
+nav button small { font-size:11px; margin-left:6px; opacity:.8; }
+.panel h2 { text-align:center; font-size:40px; font-weight:700; letter-spacing:-.02em; }
+.meta { text-align:center; color:var(--accent); font:13px ui-monospace,SFMono-Regular,Menlo,monospace; margin-top:6px; }
+.desc { text-align:center; color:var(--ink-2); max-width:620px; margin:8px auto 26px; font-size:14px; }
+.empty { text-align:center; color:var(--muted); padding:48px 0; }
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px; }
+.tile { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:22px 20px; text-align:center; }
+.tile .value { font-size:40px; font-weight:650; letter-spacing:-.02em; }
+.tile .value.hero { font-size:56px; }
+.tile .unit { font-size:16px; font-weight:500; color:var(--ink-2); margin-left:2px; }
+.tile .label { color:var(--ink); font-weight:600; margin-top:2px; }
+.tile .note { color:var(--muted); font-size:13px; margin-top:2px; }
+.pair { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; margin-top:14px; }
+.chart { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:18px 20px 12px; margin-top:14px; }
+.pair .chart { margin-top:0; }
+.chart-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:10px; flex-wrap:wrap; }
+.chart h3 { font-size:13px; font-weight:600; color:var(--ink-2); letter-spacing:.06em; text-transform:uppercase; }
+.legend { display:flex; gap:14px; font-size:13px; color:var(--ink-2); }
+.key { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:6px; vertical-align:-1px; }
+.row { display:grid; grid-template-columns:minmax(90px,38%) 1fr 64px; align-items:center; gap:12px; padding:5px 0;
+  border-radius:8px; outline:none; }
+.row:hover .track, .row:focus-visible .track { background:#1a2333; }
+.row .name { color:var(--ink); font-size:14px; line-height:1.3; }
+.row .name small { display:block; color:var(--muted); font-size:12px; }
+.grouped .row { grid-template-columns:110px 1fr 64px; padding:3px 0; }
+.grouped .row.starts { margin-top:10px; }
+.grouped .row.starts:first-of-type { margin-top:0; }
+.track { height:18px; border-radius:4px; }
+.bar { height:18px; border-radius:0 4px 4px 0; }
+.bar.memwise, .key.memwise { background:var(--memwise); }
+.bar.full, .key.full { background:var(--full); }
+.row .num { text-align:right; font-variant-numeric:tabular-nums; color:var(--ink); font-size:14px; }
+details { margin-top:14px; background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:12px 20px; }
+summary { cursor:pointer; color:var(--ink-2); font-size:14px; }
+table { width:100%; border-collapse:collapse; margin-top:10px; font-size:13px; font-variant-numeric:tabular-nums; }
+th, td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); }
+th:first-child, td:first-child { text-align:left; }
+th { color:var(--muted); font-weight:600; }
+.say p { color:var(--ink-2); font-size:14px; margin-top:8px; text-align:left; }
+.say p:first-of-type { margin-top:0; }
+.say b { color:var(--ink); }
+.say a { color:var(--accent); }
+.say .ref { color:var(--muted); font-size:13px; }
+.facts { list-style:none; margin-top:16px; color:var(--muted); font-size:13px; text-align:center; }
+.facts li + li { margin-top:2px; }
+#tip { position:fixed; pointer-events:none; background:#0b1120; border:1px solid #334155; color:var(--ink);
+  font-size:13px; padding:6px 10px; border-radius:8px; opacity:0; transition:opacity .1s; max-width:320px; }
+</style></head><body><main><header><div class="brand">memwise</div><h1>Benchmarks</h1><nav role="tablist"><button role="tab" data-name="LoCoMo" aria-selected="true">LoCoMo</button><button role="tab" disabled>LongMemEval<small>not run yet</small></button></nav></header><section class="panel" id="p-LoCoMo"><h2>LoCoMo</h2><p class="meta">1,540 questions · all conversations · 4 categories</p><p class="desc">Months of chats between two friends, then questions that need single facts (single hop), several facts together (multi-hop), inference beyond the chats (open-domain) and dates (temporal).</p><div class="tiles"><div class="tile"><div class="value hero">89.7<span class="unit"></span></div><div class="label">memwise score</div><div class="note">10 memories and 30 messages per person · answers graded correct, out of 100</div></div><div class="tile"><div class="value">4,899<span class="unit"> tokens</span></div><div class="label">Mean context per question</div><div class="note">about 84 memories and messages</div></div><div class="tile"><div class="value">88.2<span class="unit"></span></div><div class="label">Full-context score, 382 questions</div><div class="note">22,069 tokens a question, 4.6× memwise · on 382 of the questions, where memwise scored 85.3</div></div><div class="tile"><div class="value">78<span class="unit">%</span></div><div class="label">Fewer tokens than full context</div><div class="note">4,809 against 22,069 a question, on the same questions</div></div></div><div class="chart say"><div class="chart-head"><h3>What it saves</h3></div><p><b>78% fewer tokens</b> a question than sending the whole conversation: 4,809 against 22,069, on the same 382 questions, answered by the same model.</p><p>Models bill input by the token, so the memory part of every call costs 78% less. At an example price of $1.00 per million input tokens, 1,000 questions cost <b>$4.81</b> of context with memwise and $22.07 with the whole conversation. Use your model's price: the saving is the same share.</p><p>Building the memory is a one-off extra: one extraction call per chat session per person, about 3,500 tokens each, 1.9 million for all 10 conversations. Counted in, memwise used 73% fewer tokens over the whole benchmark than sending the whole conversation with every question.</p><p class="ref">Published for reference: <a href="https://mem0.ai/research">Mem0 reports 92.5</a> with 6,956 tokens a query. memwise uses 30% fewer tokens and scores 2.8 points lower. Mem0 used its own models and grader, so this is not a controlled comparison.</p></div><div class="pair"><div class="chart"><div class="chart-head"><h3>Score, out of 100</h3><div class="legend"><span><i class="key memwise"></i>memwise</span><span><i class="key full"></i>Full context</span></div></div><div class="row" tabindex="0" data-tip="memwise (10 memories and 30 messages per person): 89.7 on 1540 questions"><div class="name">memwise<small>10 memories and 30 messages per person</small></div><div class="track"><div class="bar memwise" style="width:89.70%"></div></div><div class="num">89.7</div></div><div class="row" tabindex="0" data-tip="memwise (10 memories and 30 messages per person), on the 382 questions full context answered: 85.3"><div class="name">memwise<small>same 382 questions as full context</small></div><div class="track"><div class="bar memwise" style="width:85.30%"></div></div><div class="num">85.3</div></div><div class="row" tabindex="0" data-tip="Whole conversation in the prompt: 88.2 on 382 questions"><div class="name">Full context<small>382 questions</small></div><div class="track"><div class="bar full" style="width:88.20%"></div></div><div class="num">88.2</div></div></div><div class="chart"><div class="chart-head"><h3>Mean context tokens per question</h3></div><div class="row" tabindex="0" data-tip="memwise (10 memories and 30 messages per person): 4,899 tokens of context a question"><div class="name">memwise<small>10 memories and 30 messages per person</small></div><div class="track"><div class="bar memwise" style="width:22.20%"></div></div><div class="num">4,899</div></div><div class="row" tabindex="0" data-tip="memwise on the same 382 questions: 4,809 tokens a question"><div class="name">memwise<small>same 382 questions as full context</small></div><div class="track"><div class="bar memwise" style="width:21.79%"></div></div><div class="num">4,809</div></div><div class="row" tabindex="0" data-tip="Whole conversation in the prompt: 22,069 tokens a question"><div class="name">Full context<small>382 questions</small></div><div class="track"><div class="bar full" style="width:100.00%"></div></div><div class="num">22,069</div></div></div></div><div class="chart grouped"><div class="chart-head"><h3>Score by question type, on the 382 questions both answered</h3><div class="legend"><span><i class="key memwise"></i>memwise</span><span><i class="key full"></i>Full context</span></div></div><div class="row starts" tabindex="0" data-tip="memwise, single hop: 91.0 on 100 questions"><div class="name">Single hop</div><div class="track"><div class="bar memwise" style="width:91.00%"></div></div><div class="num">91.0</div></div><div class="row" tabindex="0" data-tip="Full context, single hop: 96.0 on 100 questions"><div class="name"></div><div class="track"><div class="bar full" style="width:96.00%"></div></div><div class="num">96.0</div></div><div class="row starts" tabindex="0" data-tip="memwise, multi-hop: 92.0 on 100 questions"><div class="name">Multi-hop</div><div class="track"><div class="bar memwise" style="width:92.00%"></div></div><div class="num">92.0</div></div><div class="row" tabindex="0" data-tip="Full context, multi-hop: 94.0 on 100 questions"><div class="name"></div><div class="track"><div class="bar full" style="width:94.00%"></div></div><div class="num">94.0</div></div><div class="row starts" tabindex="0" data-tip="memwise, open-domain: 64.6 on 82 questions"><div class="name">Open-domain</div><div class="track"><div class="bar memwise" style="width:64.60%"></div></div><div class="num">64.6</div></div><div class="row" tabindex="0" data-tip="Full context, open-domain: 67.1 on 82 questions"><div class="name"></div><div class="track"><div class="bar full" style="width:67.10%"></div></div><div class="num">67.1</div></div><div class="row starts" tabindex="0" data-tip="memwise, temporal: 90.0 on 100 questions"><div class="name">Temporal</div><div class="track"><div class="bar memwise" style="width:90.00%"></div></div><div class="num">90.0</div></div><div class="row" tabindex="0" data-tip="Full context, temporal: 92.0 on 100 questions"><div class="name"></div><div class="track"><div class="bar full" style="width:92.00%"></div></div><div class="num">92.0</div></div></div><details><summary>Table view</summary><table><thead><tr><th>Set-up</th><th>Score</th><th>Single hop</th><th>Multi-hop</th><th>Open-domain</th><th>Temporal</th><th>Mean tokens</th><th>Questions</th></tr></thead><tbody><tr><td>memwise (10 memories and 30 messages per person)</td><td>89.7</td><td>93.1</td><td>90.4</td><td>65.6</td><td>87.5</td><td>4,899</td><td>1540</td></tr><tr><td>memwise (same 382 questions as full context)</td><td>85.3</td><td>91.0</td><td>92.0</td><td>64.6</td><td>90.0</td><td>4,809</td><td>382</td></tr><tr><td>Full context (382 questions)</td><td>88.2</td><td>96.0</td><td>94.0</td><td>67.1</td><td>92.0</td><td>22,069</td><td>382</td></tr></tbody></table></details><ul class="facts"><li>Answers and grading: gpt-6-luna (lenient grading, as in published results)</li><li>Embeddings: text-embedding-3-small</li><li>Headline set-up: extraction prompt friends, sensitive details stored, past recall on, 10 memories per person, messages kept and 30 recalled per person</li><li>memwise and full context answer with the same model and prompt; only the context differs.</li><li>Run on 2026-11-26. Score = share of answers graded correct (categories 1–4).</li><li>Full context was run on a sample to save tokens: 382 questions · all conversations (up to 10 of each question type per conversation). It is compared with memwise on those same questions.</li></ul></section><section class="panel" id="p-LongMemEval" hidden><h2>LongMemEval</h2><p class="desc">Long chat histories with questions on recall, multi-session reasoning, knowledge updates, temporal reasoning and abstention.</p><p class="empty">Not run yet.</p></section></main><div id="tip" role="tooltip"></div><script>
+const tabs = document.querySelectorAll('nav button');
+tabs.forEach(b => b.addEventListener('click', () => {
+  tabs.forEach(t => t.setAttribute('aria-selected', t === b));
+  document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== 'p-' + b.dataset.name);
+}));
+const tip = document.getElementById('tip');
+function show(el, x, y) { tip.textContent = el.dataset.tip; tip.style.left = (x + 14) + 'px';
+  tip.style.top = (y + 14) + 'px'; tip.style.opacity = 1; }
+document.querySelectorAll('.row[data-tip]').forEach(r => {
+  r.addEventListener('mousemove', ev => show(r, ev.clientX, ev.clientY));
+  r.addEventListener('mouseleave', () => tip.style.opacity = 0);
+  r.addEventListener('focus', () => { const b = r.getBoundingClientRect(); show(r, b.left + b.width / 2, b.bottom); });
+  r.addEventListener('blur', () => tip.style.opacity = 0);
+});
+</script></body></html>

@@ -61,12 +61,28 @@ class MemoryConfig:
     judge_related: int = 5
     judge_min_similarity: float = 0.2
 
+    # Also keep what the user said, word for word, and search it at recall (off by default).
+    # Extraction keeps what matters and drops details ("the book I read last year was Nothing Is
+    # Impossible"); kept messages still have them, and each recalled memory shows the message it
+    # came from. It stores more about the user: secrets are redacted first; when consent is
+    # required, a message the write gate refused a sensitive memory from isn't kept, and a
+    # "forget that ..." isn't either. forget() deletes the messages a memory came from and those
+    # that name it; forget_all() deletes them all. A model can miss a sensitive detail, so turn
+    # this on where keeping chat history is acceptable.
+    keep_messages: bool = False
+    # How many kept messages recall returns, besides the ones memories came from. Messages are
+    # ranked by embedding similarity and by shared keywords (names, titles), combined.
+    message_top_k: int = 10
+
     # ---- read path (retriever) ------------------------------------------
     weights: dict[str, float] = field(default_factory=lambda: {
         "relevance": 0.60, "recency": 0.15, "importance": 0.15, "confidence": 0.10})
     recency_half_life_days: float = 60
     min_relevance: float = 0.12   # below this a memory isn't even a candidate
     top_k: int = 6
+    # recall(include_past=True) also returns up to this many memories that are no longer true
+    # (replaced, retracted or expired), for questions about the past ("where did I live before?").
+    past_top_k: int = 3
     # Always-loaded memories: these predicates and kinds go into every prompt.
     # response_style is listed too, so answer-style rules load even if a model files them as a preference.
     profile_predicates: set[str] = field(default_factory=lambda: {"name", "response_style"})
