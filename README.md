@@ -104,7 +104,7 @@ From GitHub:
 pip install "git+https://github.com/pankajrohilla893/MemWise.git"
 ```
 
-To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.4.0"`.
+To pin a release, add its tag: `pip install "git+https://github.com/pankajrohilla893/MemWise.git@v0.5.0"`.
 There is nothing else to install. memwise and its built-in LLM client use only the Python
 standard library, so it works with whatever model provider you already use.
 
@@ -744,7 +744,7 @@ read paths, maintenance, deletion, and how memory differs from RAG.
 
 ## Status and limitations
 
-This is an early release (0.4). Things to know before relying on it:
+This is an early release (0.5). Things to know before relying on it:
 
 - **`RuleExtractor`** only understands a fixed list of English phrasings. Use it for tests and
   demos, and an LLM extractor in production.

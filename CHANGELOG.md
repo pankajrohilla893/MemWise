@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-11-26)
+
+Memory that keeps what the user said word for word, works out relative dates, can rewrite a
+request before searching, and a LoCoMo benchmark with results: 89.7 on 1,540 questions with 78%
+fewer tokens than sending the whole conversation.
 
 - **The extractor knows when the conversation happened.** `MemoryManager` passes its clock's
   time to extractors that take `now`, and `LLMExtractor` shows it as `<today>`. The built-in
