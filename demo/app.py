@@ -39,7 +39,7 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 
 
@@ -185,6 +185,8 @@ class Visitor:
         self.remembered: list[dict] = []   # this session's chat with memwise
         self.transcript: list[dict] = []   # the memwise chat with refs, for ingest()
         self.pending: str | None = None    # the message being answered
+        # Messages saved right away because the visitor asked, oldest first, until saved() shows them.
+        self.saving: list[tuple[str, Future]] = []
         self.used = 0                      # actions taken, against VISITOR_LIMIT
         # (kind, title, rows), newest last. kind: write, recall or session. rows: (op, text, why).
         self.events: list[tuple[str, str, list[tuple[str, str, str]]]] = []
@@ -299,7 +301,8 @@ def respond(v: Visitor):
 
     The plain chat starts at once. The memwise chat starts as soon as recall is done (a few
     milliseconds once the message is embedded). A message that asks to remember something is
-    saved while the replies are written."""
+    saved while the replies are written, and saved() shows it once that's done: this step ends
+    with the replies, so the next message needn't wait for the save."""
     if v is None or v.pending is None:
         yield views(v)
         return
@@ -309,7 +312,8 @@ def respond(v: Visitor):
     try:
         v.turn += 1
         ref = f"s{v.session}:{v.turn}"
-        saving = POOL.submit(v.mm.ingest, USER, [(ref, text)]) if REMEMBER.search(text) else None
+        if REMEMBER.search(text):
+            v.saving.append((text, POOL.submit(v.mm.ingest, USER, [(ref, text)])))
         r = v.mm.recall(USER, text, scope=v.scope, include_past=True)
         v.memory_block = v.mm.build_context(r)
         system = PERSONA + ("\n\n" + v.memory_block if v.memory_block else "")
@@ -329,14 +333,37 @@ def respond(v: Visitor):
         v.remembered += [user, {"role": "assistant", "content": remembered.text}]
         v.transcript += [{"role": "user", "content": text, "ref": ref},
                          {"role": "assistant", "content": remembered.text}]
-        if saving is not None:
-            v.event("write", f"“{_snip(text)}”: saved right away, because you asked",
-                    _write_rows(saving.result()))
     except Exception as e:  # keep the page usable on network or provider errors
         gr.Warning(f"Something went wrong: {e}")
     finally:
         v.pending = None
     yield views(v)
+
+
+def saved(v):
+    """Show the memories saved because the visitor asked, once they're saved.
+
+    Its own step after respond(), and it updates only the memory panels, so the next message
+    can be answered meanwhile without its reply being overwritten. Gradio skips a step while
+    the same step is still running for the page, which is why the wait isn't in respond()."""
+    skip = gr.skip()
+    shown = False
+    while v is not None and v.saving:
+        try:
+            text, saving = v.saving.pop(0)
+        except IndexError:  # another run of this step took it
+            break
+        try:
+            rows = _write_rows(saving.result())
+        except Exception as e:
+            gr.Warning(f"Couldn't save that memory: {e}")
+            continue
+        v.event("write", f"“{_snip(text)}”: saved right away, because you asked", rows)
+        shown = True
+    if not shown:
+        return skip, skip, skip, skip
+    choices = [(f"{m.id}: {m.text}", m.id) for m in v.mm.current(USER)]
+    return _status(v), _events(v), _known(v), gr.Dropdown(choices=choices, value=None)
 
 
 def _writing(v: Visitor, plain: Reply, remembered: Reply, panels: bool = False):
@@ -629,15 +656,17 @@ with gr.Blocks(title="memwise: long-term memory for AI products", analytics_enab
 
     OUTPUTS = [state, plain_chat, memory_chat, box, status, events, known, prompt, pick, tour_btn,
                scope]
+    PANELS = [status, events, known, pick]
 
     # Model calls cost money: none of this is offered as an API, only through the page.
     private = {"api_visibility": "private"}
     demo.load(start, [state], OUTPUTS, **private)
-    for trigger in (box.submit, send_btn.click):
-        trigger(send, [box, scope, state], OUTPUTS, show_progress="hidden", **private).then(
-            respond, [state], OUTPUTS, show_progress="hidden", **private)
-    tour_btn.click(tour_step, [state], OUTPUTS, show_progress="hidden", **private).then(
-        respond, [state], OUTPUTS, show_progress="hidden", **private)
+    answer = {"show_progress": "hidden", **private}
+    asked = [trigger(send, [box, scope, state], OUTPUTS, **answer) for trigger in (box.submit, send_btn.click)]
+    asked.append(tour_btn.click(tour_step, [state], OUTPUTS, **answer))
+    for event in asked:
+        event.then(respond, [state], OUTPUTS, **answer).then(
+            saved, [state], PANELS, trigger_mode="multiple", **answer)
     new_btn.click(new_session, [when, state], OUTPUTS, show_progress="hidden", **private)
     forget_btn.click(forget, [pick, state], OUTPUTS, **private)
     reset_btn.click(reset, [state], OUTPUTS, **private)
