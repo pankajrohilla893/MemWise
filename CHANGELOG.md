@@ -1,7 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-11-28)
 
+Replies can be streamed, calls no longer hang on networks with broken IPv6, and memwise has a
+live demo.
+
+- **Live demo.** `demo/app.py` is a web app with the same model in two chats side by side, on
+  its own and with memwise, and panels showing every memory decision and why it was made. A
+  two-minute tour follows one person over eight months: an allergy, a move to another city, a
+  work question kept apart. It runs on Hugging Face Spaces at
+  https://pankajrohilla899-memwisedemo.hf.space and is deployed from GitHub whenever `demo/`
+  changes. It's an example, not part of the package
 - **Streamed replies.** `OpenAICompatible.stream(system, messages)` yields the reply in pieces
   as the model writes it, so a chat can show the first words in under a second instead of the
   whole reply after a few. Connecting is retried like a normal call; a failure mid-reply raises
