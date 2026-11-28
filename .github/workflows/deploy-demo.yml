@@ -1,0 +1,60 @@
+name: deploy demo
+
+# Copies demo/ and the memwise package to the Hugging Face Space below. Needs the HF_TOKEN
+# secret: a Hugging Face token with write access. Without it, the job skips. See demo/README.md.
+#
+# It runs only when a push to main changes demo/. A change to the memwise package alone reaches
+# the Space with the next demo change, or when the workflow is run by hand from the Actions tab.
+
+on:
+  push:
+    branches: [main]
+    paths: ["demo/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-demo
+  cancel-in-progress: true
+
+env:
+  HF_SPACE: ${{ vars.HF_SPACE || 'pankajrohilla899/MemWiseDemo' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for the Hugging Face token
+        id: token
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::notice::No HF_TOKEN secret, so the demo wasn't deployed. See demo/README.md."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.ready == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.token.outputs.ready == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install the Hugging Face CLI
+        if: steps.token.outputs.ready == 'true'
+        run: pip install -U huggingface_hub
+      - name: Build the Space folder
+        if: steps.token.outputs.ready == 'true'
+        run: |
+          mkdir space
+          cp -r demo/. space/
+          cp -r memwise space/memwise
+          find space -name __pycache__ -prune -exec rm -rf {} +
+      - name: Upload to the Space
+        if: steps.token.outputs.ready == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # --delete removes Python files that are no longer in the repository.
+        run: >
+          hf upload "$HF_SPACE" space . --repo-type space
+          --delete "*.py" --commit-message "Deploy ${GITHUB_SHA::7} from GitHub"
