@@ -10,9 +10,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -900,8 +902,9 @@ class LLMExtractorParsing(unittest.TestCase):
 class FakeServer:
     """A local HTTP server that answers like a model provider (no network)."""
 
-    def serve(self, status: int, reply):
-        """`reply` is a dict, or a function of the request body that returns one."""
+    def serve(self, status: int, reply, content_type: str = "application/json"):
+        """`reply` is a dict (sent as JSON) or bytes (sent as they are), or a function of the
+        request body that returns one."""
         received: dict = {"bodies": []}
 
         class Handler(BaseHTTPRequestHandler):
@@ -910,9 +913,11 @@ class FakeServer:
                 received["auth"] = self.headers.get("Authorization")
                 received["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 received["bodies"].append(received["body"])
-                payload = json.dumps(reply(received["body"]) if callable(reply) else reply).encode()
+                payload = reply(received["body"]) if callable(reply) else reply
+                if not isinstance(payload, bytes):
+                    payload = json.dumps(payload).encode()
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -1058,8 +1063,8 @@ class OpenAICompatibleClient(FakeServer, unittest.TestCase):
                 raise ConnectionResetError(54, "Connection reset by peer")
             return Reply()
 
-        real_open, real_sleep = llm_module.urllib.request.urlopen, llm_module.time.sleep
-        llm_module.urllib.request.urlopen, llm_module.time.sleep = flaky, lambda s: None
+        real_open, real_sleep = llm_module._open, llm_module.time.sleep
+        llm_module._open, llm_module.time.sleep = flaky, lambda s: None
         try:
             self.assertEqual(OpenAICompatible(base_url="http://x/v1", model="m")("s", []), "ok")
             self.assertEqual(len(calls), 3)                 # two drops, then success
@@ -1068,7 +1073,7 @@ class OpenAICompatibleClient(FakeServer, unittest.TestCase):
                 OpenAICompatible(base_url="http://x/v1", model="m", retries=1)("s", [])
             self.assertEqual(len(calls), 2)
         finally:
-            llm_module.urllib.request.urlopen, llm_module.time.sleep = real_open, real_sleep
+            llm_module._open, llm_module.time.sleep = real_open, real_sleep
 
     def test_client_errors_are_not_retried(self):
         url, got = self.serve(401, {"error": {"message": "invalid api key"}})
@@ -1076,10 +1081,137 @@ class OpenAICompatibleClient(FakeServer, unittest.TestCase):
             OpenAICompatible(base_url=url, model="m", api_key="bad")("s", [])
         self.assertEqual(len(got["bodies"]), 1)
 
+    def test_streams_the_reply_in_pieces(self):
+        events = [{"choices": [{"delta": {"role": "assistant"}}]},
+                  {"choices": [{"delta": {"content": "Hel"}}]},
+                  {"choices": [{"delta": {"content": "lo!"}}]},
+                  {"choices": [], "usage": {"total_tokens": 9}}]
+        sse = b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events)
+        url, got = self.serve(200, sse + b": a comment\n\ndata: [DONE]\n\n", "text/event-stream")
+        llm = OpenAICompatible(base_url=url, model="m", options={"temperature": 0})
+        self.assertEqual(list(llm.stream("Be brief.", [{"role": "user", "content": "Hi"}])),
+                         ["Hel", "lo!"])
+        self.assertEqual(got["path"], "/v1/chat/completions")
+        self.assertIs(got["body"]["stream"], True)
+        self.assertEqual(got["body"]["temperature"], 0)
+        self.assertEqual(got["body"]["messages"][0], {"role": "system", "content": "Be brief."})
+
+    def test_a_server_that_doesnt_stream_gives_the_reply_in_one_piece(self):
+        url, _ = self.serve(200, {"choices": [{"message": {"content": "Hello!"}}]})
+        self.assertEqual(list(OpenAICompatible(base_url=url, model="m").stream("s", [])), ["Hello!"])
+
+    def test_stream_errors_are_llm_errors(self):
+        url, _ = self.serve(401, {"error": {"message": "invalid api key"}})
+        with self.assertRaises(LLMError) as caught:
+            list(OpenAICompatible(base_url=url, model="m").stream("s", []))
+        self.assertEqual(caught.exception.status, 401)
+        broken = b'data: {"choices": [{"delta": {"content": "Hi"}}]}\n\ndata: {"choi'
+        url, _ = self.serve(200, broken, "text/event-stream")
+        pieces = []
+        with self.assertRaises(LLMError):
+            for piece in OpenAICompatible(base_url=url, model="m").stream("s", []):
+                pieces.append(piece)
+        self.assertEqual(pieces, ["Hi"])                      # what came before the error stays
+
     def test_from_env_explains_what_to_set(self):
         with self.assertRaises(LLMError) as caught:
             OpenAICompatible.from_env(prefix="MEMWISE_TEST_UNSET_")
         self.assertIn("MEMWISE_TEST_UNSET_BASE_URL", str(caught.exception))
+
+
+class BlackHole:
+    """A socket to an address on a network that drops its packets: connect() waits out the
+    socket's timeout, as on a network with broken IPv6."""
+
+    family = socket.AF_INET6
+
+    def __init__(self, release: threading.Event):
+        self.release, self.timeout = release, None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def bind(self, address):
+        pass
+
+    def connect(self, address):
+        self.release.wait(self.timeout)
+        raise TimeoutError("timed out")
+
+    def close(self):
+        pass
+
+
+class Network:
+    """The `socket` module as memwise.llm sees it, on a network where a host has an IPv6 address
+    that never answers and an IPv4 one (the fake server) that does."""
+
+    def __init__(self, ipv4_port: int):
+        self.ipv4_port, self.tried, self.release = ipv4_port, [], threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(socket, name)
+
+    def getaddrinfo(self, host, port, *args, **kwargs):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", self.ipv4_port))]
+
+    def socket(self, family, kind, proto):
+        self.tried.append("IPv6" if family == socket.AF_INET6 else "IPv4")
+        return BlackHole(self.release) if family == socket.AF_INET6 else socket.socket(family, kind, proto)
+
+
+class Connecting(FakeServer, unittest.TestCase):
+    """The clients try a host's IPv6 and IPv4 addresses side by side, so a network that drops
+    IPv6 doesn't make every request wait out the timeout."""
+
+    def network(self, ipv4_port: int) -> Network:
+        import memwise.llm as llm_module
+        net = Network(ipv4_port)
+        real = llm_module.socket
+        llm_module.socket = net
+        llm_module._family_that_worked.clear()
+        self.addCleanup(llm_module._family_that_worked.clear)
+        self.addCleanup(setattr, llm_module, "socket", real)
+        self.addCleanup(net.release.set)
+        return net
+
+    def test_an_address_that_never_answers_doesnt_hold_up_the_request(self):
+        url, _ = self.serve(200, {"choices": [{"message": {"content": "ok"}}]})
+        port = int(url.rsplit(":", 1)[1].split("/")[0])
+        net = self.network(port)
+        llm = OpenAICompatible(base_url=f"http://provider.test:{port}/v1", model="m", timeout=20)
+        started = time.monotonic()
+        self.assertEqual(llm("s", []), "ok")
+        self.assertLess(time.monotonic() - started, 5)       # 0.25 s, not the 20 s timeout
+        self.assertEqual(net.tried, ["IPv6", "IPv4"])
+        net.tried.clear()
+        self.assertEqual(llm("s", []), "ok")                  # IPv4 worked: it goes first now
+        self.assertEqual(net.tried, ["IPv4"])
+
+    def test_when_no_address_connects_the_error_is_an_llm_error(self):
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()                                        # nothing listens there now
+        self.network(port)
+        llm = OpenAICompatible(base_url=f"http://provider.test:{port}/v1", model="m",
+                               timeout=0.5, retries=0)
+        started = time.monotonic()
+        with self.assertRaises(LLMError):
+            llm("s", [])
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_address_families_take_turns(self):
+        from memwise.llm import _family_that_worked, _in_turn
+        v6 = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (f"2001:db8::{i}", 443, 0, 0))
+              for i in range(3)]
+        v4 = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443))]
+        self.addCleanup(_family_that_worked.clear)
+        _family_that_worked.clear()
+        self.assertEqual(_in_turn("h", v6 + v4), [v6[0], v4[0], v6[1], v6[2]])
+        _family_that_worked["h"] = socket.AF_INET
+        self.assertEqual(_in_turn("h", v6 + v4), [v4[0], v6[0], v6[1], v6[2]])
 
 
 def fake_embeddings(body):

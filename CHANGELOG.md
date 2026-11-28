@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Streamed replies.** `OpenAICompatible.stream(system, messages)` yields the reply in pieces
+  as the model writes it, so a chat can show the first words in under a second instead of the
+  whole reply after a few. Connecting is retried like a normal call; a failure mid-reply raises
+  `LLMError`. A server that doesn't stream gives the whole reply as one piece. The live demo
+  uses it
+- **No more hangs on networks with broken IPv6.** Some networks give a host IPv6 addresses but
+  drop IPv6 traffic. Python connects to a host's addresses one at a time and waits the whole
+  timeout on each, so there every call from `OpenAICompatible` and `OpenAICompatibleEmbedder`
+  waited out `timeout` (two minutes by default) before trying IPv4, and gave up if that took
+  too long. The clients now connect the way browsers do ("happy eyeballs", RFC 8305): a host's
+  addresses are tried in turn, IPv6 and IPv4 alternating, and the next one starts when the
+  last fails or hasn't connected in 0.25 s. The first connection made is used, and that
+  family goes first for the host next time, so a network without working IPv6 costs 0.25 s
+  once. Standard library only, and proxy settings still apply. They no longer go through a
+  global opener installed with `urllib.request.install_opener`
+
 ## 0.6.0 (2026-11-26)
 
 memwise can keep what the assistant said, and is measured on a second benchmark, LongMemEval.

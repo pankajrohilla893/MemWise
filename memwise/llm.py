@@ -36,13 +36,14 @@ import json
 import logging
 import math
 import os
+import socket
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
 from datetime import datetime
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from .dates import with_dates
 from .models import KINDS, Candidate, Memory
@@ -517,6 +518,132 @@ def parse_queries(reply: str, request: str = "") -> list[str]:
             out.append(q)
     return out
 
+# --------------------------------------------------------------------------- connecting
+
+# Some networks give a host IPv6 addresses but drop IPv6 traffic. Python's own connect tries a
+# host's addresses one at a time, each for the whole timeout, so there every request would wait
+# the client's `timeout` (two minutes by default) before trying IPv4. The clients below connect
+# the way browsers do ("happy eyeballs", RFC 8305): a host's addresses are tried in turn, IPv6
+# and IPv4 alternating, and the next one starts when the last fails or hasn't connected in
+# 0.25 s. The first connection made is used, and next time that host's addresses of the same
+# family are tried first, so a network without working IPv6 costs 0.25 s once, not every time.
+
+_NEXT_ATTEMPT_AFTER = 0.25
+_family_that_worked: dict[str, int] = {}   # host -> the address family that last connected
+_family_lock = threading.Lock()
+
+
+def _in_turn(host: str, infos: list) -> list:
+    """`infos` (from getaddrinfo) with the address families alternating, starting with the one
+    that last connected to `host`, else with the first one listed."""
+    with _family_lock:
+        first = _family_that_worked.get(host, infos[0][0])
+    by_family: dict[int, list] = {}
+    for info in infos:
+        by_family.setdefault(info[0], []).append(info)
+    queues = sorted(by_family.values(), key=lambda q: q[0][0] != first)
+    return [q[i] for i in range(max(map(len, queues))) for q in queues if i < len(q)]
+
+
+def _connect(address: tuple[str, int], timeout: Any = None,
+             source_address: tuple[str, int] | None = None) -> socket.socket:
+    """Like `socket.create_connection`, but tries a host's addresses as described above.
+    `timeout` covers all the attempts together; the socket returned keeps it for reading."""
+    host, port = address[:2]
+    if not isinstance(timeout, (int, float)):   # http.client's "no timeout given"
+        timeout = socket.getdefaulttimeout()
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"No address found for {host}")
+    infos = _in_turn(host, infos)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    changed = threading.Condition()
+    errors: dict[int, OSError] = {}
+    winner: list[socket.socket] = []
+    over = False   # set once a socket is returned or an error raised: late connections close
+
+    def attempt(n: int, family: int, kind: int, proto: int, sockaddr: Any) -> None:
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            if deadline is not None:
+                sock.settimeout(max(0.001, deadline - time.monotonic()))
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+        except OSError as e:
+            if sock is not None:
+                sock.close()
+            with changed:
+                errors[n] = e
+                changed.notify()
+            return
+        with changed:
+            if over or winner:
+                sock.close()
+            else:
+                winner.append(sock)
+                changed.notify()
+
+    started, next_start = 0, time.monotonic()
+    with changed:
+        while not winner:
+            now = time.monotonic()
+            if started < len(infos) and (now >= next_start or len(errors) == started):
+                family, kind, proto, _, sockaddr = infos[started]
+                threading.Thread(target=attempt, args=(started, family, kind, proto, sockaddr),
+                                 name="memwise-connect", daemon=True).start()
+                started, next_start = started + 1, now + _NEXT_ATTEMPT_AFTER
+                continue
+            if len(errors) == len(infos):
+                over = True
+                raise errors[len(infos) - 1]   # as Python does: the last address's error
+            if deadline is not None and now >= deadline:
+                over = True
+                raise TimeoutError(f"Couldn't connect to {host} in {timeout:g}s")
+            wake = [t for t in (deadline, next_start if started < len(infos) else None)
+                    if t is not None]
+            changed.wait(min(wake) - now if wake else None)
+        over = True
+    sock = winner[0]
+    sock.settimeout(timeout)
+    with _family_lock:
+        if len(_family_that_worked) >= 256:
+            _family_that_worked.clear()
+        _family_that_worked[host] = sock.family
+    return sock
+
+
+class _Connecting:
+    """Makes urllib's HTTP and HTTPS handlers connect with `_connect`."""
+
+    def do_open(self, http_class: Any, req: Any, **kwargs: Any) -> Any:
+        def connection(*args: Any, **kw: Any) -> Any:
+            conn = http_class(*args, **kw)
+            conn._create_connection = _connect
+            return conn
+        return super().do_open(connection, req, **kwargs)  # type: ignore[misc]
+
+
+class _HTTPHandler(_Connecting, urllib.request.HTTPHandler):
+    pass
+
+
+class _HTTPSHandler(_Connecting, urllib.request.HTTPSHandler):
+    pass
+
+
+_opener: urllib.request.OpenerDirector | None = None
+
+
+def _open(request: urllib.request.Request, timeout: float) -> Any:
+    """`urllib.request.urlopen`, connecting with `_connect` (proxy settings still apply)."""
+    global _opener
+    if _opener is None:
+        _opener = urllib.request.build_opener(_HTTPHandler, _HTTPSHandler)
+    return _opener.open(request, timeout=timeout)
+
+
 # --------------------------------------------------------------------------- ready-made clients
 
 _C = TypeVar("_C", bound="_Client")
@@ -564,10 +691,12 @@ class _Client:
     def _post(self, path: str, body: dict[str, Any]) -> Any:
         """POST JSON and return the JSON reply. A dropped connection or HTTP 408/429/5xx is
         retried `retries` times, after 0.5s, 1s, 2s...; every failure is raised as LLMError."""
-        data = json.dumps(body).encode("utf-8")
+        return self._retrying(self._post_once, path, json.dumps(body).encode("utf-8"))
+
+    def _retrying(self, send: Callable[[str, bytes], Any], path: str, data: bytes) -> Any:
         for attempt in range(self.retries + 1):
             try:
-                return self._post_once(path, data)
+                return send(path, data)
             except _Transient:
                 if attempt == self.retries:
                     raise
@@ -575,22 +704,31 @@ class _Client:
         raise AssertionError("unreachable")
 
     def _post_once(self, path: str, data: bytes) -> Any:
+        with self._open_once(path, data) as response:
+            try:
+                return json.load(response)
+            except (TimeoutError, json.JSONDecodeError) as e:   # a slow model is slow again: no retry
+                raise LLMError(f"Bad or missing reply from {self.base_url}: {e}") from None
+            except (OSError, http.client.HTTPException) as e:   # the connection dropped mid-reply
+                raise _Transient(f"Lost the connection to {self.base_url}: {e!r}") from None
+
+    def _open_once(self, path: str, data: bytes) -> Any:
+        """Send one POST and return the response, its body still to be read."""
         request = urllib.request.Request(self.base_url + path, data=data, headers=self._headers,
                                          method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.load(response)
+            return _open(request, self.timeout)
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:500]
             kind = _Transient if e.code in (408, 429) or e.code >= 500 else LLMError
             raise kind(f"{self.base_url} returned HTTP {e.code}: {detail}", status=e.code) from None
-        except (TimeoutError, json.JSONDecodeError) as e:   # a slow model is slow again: no retry
-            raise LLMError(f"Bad or missing reply from {self.base_url}: {e}") from None
+        except TimeoutError:   # sent, but no answer in time: a slow model is slow again, no retry
+            raise LLMError(f"No reply from {self.base_url} in {self.timeout:g}s") from None
         except urllib.error.URLError as e:
             if isinstance(e.reason, TimeoutError):
                 raise LLMError(f"No reply from {self.base_url} in {self.timeout:g}s") from None
             raise _Transient(f"Couldn't reach {self.base_url}: {e.reason}") from None
-        except (OSError, http.client.HTTPException) as e:   # the connection dropped mid-reply
+        except (OSError, http.client.HTTPException) as e:   # the connection dropped
             raise _Transient(f"Lost the connection to {self.base_url}: {e!r}") from None
 
 
@@ -602,6 +740,11 @@ class OpenAICompatible(_Client):
 
         llm = OpenAICompatible(base_url="https://api.example.com/v1", model="...", api_key="...")
         reply = llm("You are a helpful assistant.", [{"role": "user", "content": "Hi!"}])
+
+    For a chat that shows the reply as it's written, `stream` yields it in pieces:
+
+        for piece in llm.stream("You are a helpful assistant.", messages):
+            print(piece, end="", flush=True)
 
     `OpenAICompatible.from_env()` reads MEMWISE_BASE_URL, MEMWISE_MODEL and MEMWISE_API_KEY.
 
@@ -618,13 +761,50 @@ class OpenAICompatible(_Client):
     _kind = "LLM"
 
     def __call__(self, system: str, messages: list[ChatMessage]) -> str:
-        data = self._post("/chat/completions", {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system}, *messages],
-            **self.options,
-        })
+        return self._content(self._post("/chat/completions", self._body(system, messages)), "message")
+
+    def stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+        """The reply in pieces, as the model writes it: the first words come in well under a
+        second, instead of the whole reply after a few. Connecting is retried like a normal call;
+        a failure after that, mid-reply, raises LLMError. A server that answers with the whole
+        reply at once (no event stream) gives it as one piece."""
+        data = json.dumps({**self._body(system, messages), "stream": True}).encode("utf-8")
+        with self._retrying(self._open_once, "/chat/completions", data) as response:
+            try:
+                if "text/event-stream" not in (response.headers.get("Content-Type") or ""):
+                    yield self._content(json.load(response), "message")
+                    return
+                for line in response:
+                    line = line.strip()
+                    if not line.startswith(b"data:"):
+                        continue                       # blank lines and comments
+                    payload = line[5:].strip()
+                    if payload == b"[DONE]":
+                        return
+                    chunk = json.loads(payload)
+                    if isinstance(chunk, dict) and chunk.get("error"):
+                        raise LLMError(f"{self.base_url} stopped with an error: {str(chunk)[:300]}")
+                    if isinstance(chunk, dict) and not chunk.get("choices"):
+                        continue                       # e.g. a usage report
+                    piece = self._content(chunk, "delta")
+                    if piece:
+                        yield piece
+            except json.JSONDecodeError as e:
+                raise LLMError(f"Bad reply from {self.base_url}: {e}") from None
+            except TimeoutError:
+                raise LLMError(f"The reply from {self.base_url} stopped for {self.timeout:g}s") from None
+            except (OSError, http.client.HTTPException) as e:
+                raise LLMError(f"Lost the connection to {self.base_url} mid-reply: {e!r}") from None
+
+    def _body(self, system: str, messages: list[ChatMessage]) -> dict[str, Any]:
+        return {"model": self.model,
+                "messages": [{"role": "system", "content": system}, *messages],
+                **self.options}
+
+    def _content(self, data: Any, key: str) -> str:
+        """The text in `choices[0][key]` of a reply ("message") or a streamed piece ("delta")."""
         try:
-            content = data["choices"][0]["message"].get("content")
+            content = data["choices"][0][key].get("content")
         except (KeyError, IndexError, TypeError, AttributeError):
             raise LLMError(f"Unexpected reply from {self.base_url}: {str(data)[:300]}") from None
         if isinstance(content, list):  # some servers return a list of content parts
