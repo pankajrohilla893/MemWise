@@ -3,12 +3,12 @@
 **Long-term memory for AI products that decides what to keep, notices when facts stop being true, and checks whether to speak up.**
 
 [![tests](https://github.com/pankajrohilla893/MemWise/actions/workflows/tests.yml/badge.svg)](https://github.com/pankajrohilla893/MemWise/actions/workflows/tests.yml)
-[![live demo](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm.svg)](https://huggingface.co/spaces/pankajrohilla899/MemWiseDemo)
+[![live demo](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm.svg)](https://pankajrohilla899-memwisedemo.hf.space)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![dependencies](https://img.shields.io/badge/core%20dependencies-none-brightgreen)
 
-**[Try the live demo →](https://huggingface.co/spaces/pankajrohilla899/MemWiseDemo)** The same
+**[Try the live demo →](https://pankajrohilla899-memwisedemo.hf.space)** The same
 model in two chats side by side, on its own and with memwise. Tell it about yourself, skip ahead
 months, and see which one still knows you, with every memory decision shown and explained. The
 two-minute tour needs no sign-up.
@@ -680,7 +680,7 @@ back and never reach the prompt.
 
 | File | What it shows |
 |---|---|
-| [`demo/app.py`](demo/app.py) | The [live demo](https://huggingface.co/spaces/pankajrohilla899/MemWiseDemo): two chats side by side, without and with memwise, and panels showing every decision. `python demo/app.py` runs it locally; see [`demo/README.md`](demo/README.md) |
+| [`demo/app.py`](demo/app.py) | The [live demo](https://pankajrohilla899-memwisedemo.hf.space): two chats side by side, without and with memwise, and panels showing every decision. `python demo/app.py` runs it locally; see [`demo/README.md`](demo/README.md) |
 | [`examples/quickstart.py`](examples/quickstart.py) | The whole API on one page |
 | [`examples/demo.py`](examples/demo.py) | A guided story over 8 months of simulated time: write gate, superseding, expiry, staleness, forgetting, audit log |
 | [`examples/chat.py`](examples/chat.py) | An interactive chat with memory: type `/context` to see the prompt, `/log` to see every decision, `/advance 200` to jump ahead in time |
